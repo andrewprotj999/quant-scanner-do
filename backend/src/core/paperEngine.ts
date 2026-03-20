@@ -667,9 +667,30 @@ export async function runEngineCycle(userId: number = DEFAULT_USER_ID): Promise<
 
 // ─── POSITION MONITOR ───────────────────────────────────────
 
+// Track consecutive unfetchable price failures per position
+const unfetchableCounters = new Map<number, number>();
+
 async function monitorPosition(pos: any, userId: number): Promise<boolean> {
   const pair = await fetchPairPrice(pos.pairAddress, pos.chain);
-  if (!pair || !pair.priceUsd) return false;
+
+  // ─── UNFETCHABLE PRICE AUTO-CLOSE ─────────────────────────
+  if (!pair || !pair.priceUsd) {
+    const count = (unfetchableCounters.get(pos.id) ?? 0) + 1;
+    unfetchableCounters.set(pos.id, count);
+    console.log(`[Engine] ${pos.tokenSymbol} price unfetchable (${count}/${CONFIG.unfetchableMaxRetries})`);
+
+    if (count >= CONFIG.unfetchableMaxRetries) {
+      unfetchableCounters.delete(pos.id);
+      const entryPrice = parseFloat(pos.entryPrice);
+      // Close at entry price (0 P&L) since we can't get real price
+      return await closePosition(pos, userId, entryPrice, "closed",
+        `Auto-closed: price data unavailable for ${count} consecutive checks`);
+    }
+    return false;
+  }
+
+  // Reset unfetchable counter on successful fetch
+  unfetchableCounters.delete(pos.id);
 
   const currentPrice = parseFloat(pair.priceUsd);
   const entryPrice = parseFloat(pos.entryPrice);
@@ -748,6 +769,18 @@ async function monitorPosition(pos: any, userId: number): Promise<boolean> {
   const entryVolume = parseFloat(pos.entryVolume ?? "0");
   if (entryVolume > 0 && currentVolH1 < entryVolume * dynamicParams.volDryUpThreshold && pnlPercent > 5) {
     return await closePosition(pos, userId, currentPrice, "closed", `Volume dry-up exit`);
+  }
+
+  // ─── STALE POSITION AUTO-CLOSE ────────────────────────────
+  if (pos.openedAt) {
+    const holdDurationMs = Date.now() - new Date(pos.openedAt).getTime();
+    const absPnlPct = Math.abs(pnlPercent);
+
+    if (holdDurationMs >= CONFIG.stalePositionTimeoutMs && absPnlPct < CONFIG.stalePositionMinMovePct) {
+      const holdHours = (holdDurationMs / 3600000).toFixed(1);
+      return await closePosition(pos, userId, currentPrice, "closed",
+        `Stale position: held ${holdHours}h with only ${pnlPercent >= 0 ? "+" : ""}${pnlPercent.toFixed(1)}% move (min ${CONFIG.stalePositionMinMovePct}% required)`);
+    }
   }
 
   // Just update
