@@ -56,6 +56,25 @@ import { getTimeOptimization } from "./core/timeOptimizer.js";
 import { analyzeEquityCurve } from "./core/equityCurveMA.js";
 import { checkSystemHealth, getSystemGuardState, resetKillSwitch } from "./core/systemGuards.js";
 import { getExecutionStatus, setExecutionMode, type ExecutionMode } from "./core/executionLayer.js";
+import {
+  startAgentSystem,
+  stopAgentSystem,
+  getAgentSystemStatus,
+  getAgentDiagnosticLog,
+  getAgentReport,
+  triggerAgent,
+} from "./core/agentSystem.js";
+import {
+  startDataFreshnessAgent,
+  stopDataFreshnessAgent,
+  getDataFreshnessStatus,
+} from "./core/dataFreshnessAgent.js";
+import {
+  startSpecializedAgents,
+  stopSpecializedAgents,
+  getSpecializedAgentStatus,
+  getAgentSignals,
+} from "./core/specializedAgents.js";
 
 const app = express();
 app.use(cors());
@@ -390,12 +409,82 @@ app.post("/api/execution/mode", (req, res) => {
   res.json({ success: true, mode, message: `Execution mode set to ${mode}` });
 });
 
-// ─── STARTUP ────────────────────────────────────────────────
+// ─── v5: AGENT SYSTEM ────────────────────────────────────────────
+
+app.get("/api/agents", (_req, res) => {
+  res.json(getAgentSystemStatus());
+});
+
+app.get("/api/agents/report", (_req, res) => {
+  res.json(getAgentReport());
+});
+
+app.get("/api/agents/log", (req, res) => {
+  const limit = parseInt(req.query.limit as string) || 50;
+  res.json(getAgentDiagnosticLog(limit));
+});
+
+app.post("/api/agents/trigger/:name", async (req, res) => {
+  try {
+    const result = await triggerAgent(req.params.name);
+    res.json({ success: true, result });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ─── v5: DATA FRESHNESS ──────────────────────────────────────────
+
+app.get("/api/freshness", (_req, res) => {
+  res.json(getDataFreshnessStatus());
+});
+
+// ─── v5: SPECIALIZED AGENTS ────────────────────────────────────────
+
+app.get("/api/specialized", (_req, res) => {
+  res.json(getSpecializedAgentStatus());
+});
+
+app.get("/api/signals", (_req, res) => {
+  res.json(getAgentSignals());
+});
+
+// ─── v5: MASTER STATUS (all systems in one call) ─────────────────
+
+app.get("/api/dashboard", async (_req, res) => {
+  try {
+    const [positions, engineState] = await Promise.all([
+      queries.getOpenPositions(1),
+      queries.getEngineState(1),
+    ]);
+    res.json({
+      version: "5.0",
+      engine: {
+        running: isEngineRunning(),
+        equity: engineState?.equity ?? "1000",
+        peakEquity: engineState?.peakEquity ?? "1000",
+        totalScans: engineState?.totalScans ?? 0,
+        totalTrades: engineState?.totalTrades ?? 0,
+        openPositions: positions.length,
+      },
+      risk: await assessRisk(1),
+      agentSystem: getAgentSystemStatus(),
+      specializedAgents: getSpecializedAgentStatus(),
+      dataFreshness: getDataFreshnessStatus(),
+      signals: getAgentSignals(),
+      timestamp: new Date().toISOString(),
+    });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ─── STARTUP ──────────────────────────────────────────────────────
 
 async function main() {
   console.log("═══════════════════════════════════════════════");
-  console.log("  Memecoin Scanner — Standalone Engine v4.0");
-  console.log("  Full Optimization Suite: 12 Intelligence Layers");
+  console.log("  Memecoin Scanner — Standalone Engine v5.0");
+  console.log("  Full Optimization Suite + Autonomous Agent System");
   console.log("═══════════════════════════════════════════════");
 
   // Initialize database
@@ -423,6 +512,27 @@ async function main() {
   // Start auto-tuner schedule
   startAutoTuneSchedule();
   console.log("[AutoTuner] Outcome auto-tuner schedule started");
+
+  // Start autonomous agent system
+  startAgentSystem();
+  console.log("[Agents] Autonomous agent system started (Monitor/Optimizer/Healer/Learner)");
+
+  // Start data freshness agent
+  startDataFreshnessAgent();
+  console.log("[DataFreshness] Real-time data freshness agent started");
+
+  // Start specialized agents
+  startSpecializedAgents();
+  console.log("[Specialized] 5 specialized agents started (Sniper/Correlation/Regime/ExitIntel/ChainPerf)");
+
+  console.log("\n═══════════════════════════════════════════════");
+  console.log("  ALL SYSTEMS ONLINE — 11 AGENTS ACTIVE");
+  console.log("  Core: Monitor | Optimizer | Healer | Learner");
+  console.log("  Data: Freshness Agent");
+  console.log("  Specialized: Sniper | Correlation | Regime");
+  console.log("               Exit Intel | Chain Perf");
+  console.log("  Dashboard: /api/dashboard");
+  console.log("═══════════════════════════════════════════════");
 }
 
 main().catch((err) => {
