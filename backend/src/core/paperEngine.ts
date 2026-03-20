@@ -1,15 +1,26 @@
 /**
- * Paper Trading Engine — Standalone Version
+ * Paper Trading Engine — Standalone Version (v2)
  *
  * Autonomous scanner + executor running on a 30-second interval.
  * Each cycle:
  * 1. Fetches trending/boosted tokens from DexScreener (all chains)
  * 2. Qualifies each token against 9+ trading rules with rug detection
- * 3. Auto-opens paper positions for qualifying setups
- * 4. Monitors open positions for SL/TP/trailing stop/circuit breaker
- * 5. Logs everything and sends Telegram notifications
+ * 3. Scores social sentiment and whale activity (dimensions 10 & 11)
+ * 4. Auto-opens paper positions for qualifying setups
+ * 5. Monitors open positions with 4-tier profit-taking + adaptive trailing stop
+ * 6. Fetches outcome prices for learning loop
+ * 7. Logs everything and sends Telegram notifications
  *
  * Zero Manus dependencies. Uses SQLite + Telegram.
+ *
+ * v2 additions:
+ * - Global rate limiter (token-bucket, 25 req/min)
+ * - 3-minute discovery cache + scan data reuse for position monitoring
+ * - 4-tier profit-taking: Early (+12%), TP1 (+20%), TP2 (+40%), trail remaining
+ * - Adaptive trailing stop that tightens with profit + momentum fade
+ * - SL ratchet: stop only moves UP
+ * - Social sentiment & whale tracking as conviction dimensions
+ * - Outcome price fetcher for auto-tuner learning loop
  */
 
 import { CONFIG } from "../config.js";
@@ -24,6 +35,9 @@ import {
   withDbRetry,
   setSelfHealCallback,
 } from "./healthMonitor.js";
+import { dexFetch, dexFetchCached, getDexRateLimiterMetrics } from "./dexRateLimiter.js";
+import { extractSocialSignals, calculateSocialScore, getSocialRiskFlags } from "./socialSentiment.js";
+import { analyzeWhaleActivity, calculateWhaleScore, getWhaleRiskFlags } from "./whaleTracker.js";
 
 // ─── DYNAMIC PARAMS (loaded from DB, refreshed each cycle) ──
 
@@ -42,6 +56,16 @@ let dynamicParams = {
   circuitBreakerPct: 50,
   rugLiqFdvMax: 5,
   volDryUpThreshold: 0.02,
+  // 4-tier profit-taking params
+  tpEarlyPercent: 12,
+  tpEarlySellRatio: 0.20,
+  tp1SellRatio: 0.25,
+  tp2Percent: 40,
+  tp2SellRatio: 0.25,
+  trailInitial: 10,
+  trailGainIncrement: 5,
+  trailMinPercent: 4,
+  earlyProfitLockPercent: 2,
 };
 
 async function refreshDynamicParams(): Promise<void> {
@@ -63,6 +87,16 @@ async function refreshDynamicParams(): Promise<void> {
         circuitBreakerPct: parseFloat(String(dbParams.circuitBreakerPct ?? "50")),
         rugLiqFdvMax: parseFloat(String(dbParams.rugLiqFdvMax ?? "5")),
         volDryUpThreshold: parseFloat(String(dbParams.volDryUpThreshold ?? "0.02")),
+        // 4-tier profit-taking
+        tpEarlyPercent: parseFloat(String((dbParams as any).tpEarlyPercent ?? "12")),
+        tpEarlySellRatio: parseFloat(String((dbParams as any).tpEarlySellRatio ?? "0.20")),
+        tp1SellRatio: parseFloat(String((dbParams as any).tp1SellRatio ?? "0.25")),
+        tp2Percent: parseFloat(String((dbParams as any).tp2Percent ?? "40")),
+        tp2SellRatio: parseFloat(String((dbParams as any).tp2SellRatio ?? "0.25")),
+        trailInitial: parseFloat(String((dbParams as any).trailInitial ?? "10")),
+        trailGainIncrement: parseFloat(String((dbParams as any).trailGainIncrement ?? "5")),
+        trailMinPercent: parseFloat(String((dbParams as any).trailMinPercent ?? "4")),
+        earlyProfitLockPercent: parseFloat(String((dbParams as any).earlyProfitLockPercent ?? "2")),
       };
       console.log(`[Engine] Loaded dynamic params v${dbParams.version ?? 1}`);
     }
@@ -86,14 +120,16 @@ interface DexPair {
   priceUsd: string;
   priceChange?: { h1?: number; h6?: number; h24?: number; m5?: number };
   liquidity?: { usd?: number };
-  volume?: { h24?: number; h1?: number; m5?: number };
+  volume?: { h24?: number; h1?: number; h6?: number; m5?: number };
   txns?: {
     h1?: { buys?: number; sells?: number };
     m5?: { buys?: number; sells?: number };
+    h6?: { buys?: number; sells?: number };
   };
   fdv?: number;
   pairCreatedAt?: number;
-  info?: { socials?: any[] };
+  info?: { socials?: any[]; imageUrl?: string };
+  boosted?: boolean;
 }
 
 interface QualificationResult {
@@ -104,28 +140,15 @@ interface QualificationResult {
   pair: DexPair;
 }
 
-// ─── DEXSCREENER API (with timeout + retry) ─────────────────
+// ─── DEXSCREENER API (rate-limited + cached) ────────────────
 
 const DEX_API = "https://api.dexscreener.com";
 
-async function trackedFetch(url: string, timeoutMs = 10000): Promise<Response> {
-  const start = Date.now();
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+// Shared pair data map — populated by scan, reused by position monitor
+let lastScanPairMap = new Map<string, DexPair>(); // key: pairAddress
 
-  try {
-    const res = await fetch(url, {
-      signal: controller.signal,
-      headers: { Accept: "application/json" },
-    });
-    clearTimeout(timeout);
-    recordApiCall(Date.now() - start, res.ok);
-    return res;
-  } catch (err) {
-    clearTimeout(timeout);
-    recordApiCall(Date.now() - start, false);
-    throw err;
-  }
+export function getScanPairMap(): Map<string, DexPair> {
+  return lastScanPairMap;
 }
 
 async function fetchAllTokenSources(): Promise<DexPair[]> {
@@ -148,23 +171,24 @@ async function fetchAllTokenSources(): Promise<DexPair[]> {
     }
   }
 
+  // ── Source 1-4: Fetch all sources via rate-limited cached API ──
   const [topBoosts, latestBoosts, latestProfiles, trendingResults] =
     await Promise.allSettled([
-      trackedFetch(`${DEX_API}/token-boosts/top/v1`)
-        .then((r) => (r.ok ? r.json() : []))
+      dexFetchCached(`${DEX_API}/token-boosts/top/v1`, 30_000, "normal")
+        .then((d: any) => (Array.isArray(d) ? d : []))
         .catch(() => []),
-      trackedFetch(`${DEX_API}/token-boosts/latest/v1`)
-        .then((r) => (r.ok ? r.json() : []))
+      dexFetchCached(`${DEX_API}/token-boosts/latest/v1`, 30_000, "normal")
+        .then((d: any) => (Array.isArray(d) ? d : []))
         .catch(() => []),
-      trackedFetch(`${DEX_API}/token-profiles/latest/v1`)
-        .then((r) => (r.ok ? r.json() : []))
+      dexFetchCached(`${DEX_API}/token-profiles/latest/v1`, 30_000, "normal")
+        .then((d: any) => (Array.isArray(d) ? d : []))
         .catch(() => []),
+      // Trending search (90s cache — barely changes)
       Promise.allSettled(
         ["meme", "AI", "gaming", "DeFi", "RWA"].map((q) =>
-          trackedFetch(`${DEX_API}/latest/dex/search?q=${q}`)
-            .then((r) => (r.ok ? r.json() : { pairs: [] }))
-            .then((d) =>
-              (d.pairs || []).map((p: any) => ({
+          dexFetchCached(`${DEX_API}/latest/dex/search?q=${q}`, 90_000, "low")
+            .then((d: any) =>
+              (d?.pairs || []).map((p: any) => ({
                 chainId: p.chainId,
                 tokenAddress: p.baseToken?.address,
               }))
@@ -191,7 +215,7 @@ async function fetchAllTokenSources(): Promise<DexPair[]> {
 
   console.log(`[Engine] Discovered ${allTokenRefs.length} unique tokens across 4 sources`);
 
-  // Batch fetch pair data by chain
+  // Batch fetch pair data by chain (rate-limited)
   const byChain = new Map<string, string[]>();
   for (const t of allTokenRefs) {
     const arr = byChain.get(t.chainId) || [];
@@ -204,9 +228,8 @@ async function fetchAllTokenSources(): Promise<DexPair[]> {
     for (let i = 0; i < addresses.length; i += 30) {
       const batch = addresses.slice(i, i + 30).join(",");
       pairFetches.push(
-        trackedFetch(`${DEX_API}/tokens/v1/${chainId}/${batch}`)
-          .then((r) => (r.ok ? r.json() : []))
-          .then((d) => (Array.isArray(d) ? d : []))
+        dexFetchCached(`${DEX_API}/tokens/v1/${chainId}/${batch}`, 30_000, "normal")
+          .then((d: any) => (Array.isArray(d) ? d : []))
           .catch(() => [] as DexPair[])
       );
     }
@@ -218,13 +241,15 @@ async function fetchAllTokenSources(): Promise<DexPair[]> {
     if (result.status === "fulfilled") allPairs.push(...result.value);
   }
 
-  // Deduplicate
+  // Deduplicate and build pair map
   const seenPairs = new Set<string>();
   const uniquePairs: DexPair[] = [];
+  lastScanPairMap = new Map();
   for (const pair of allPairs) {
     if (pair.pairAddress && !seenPairs.has(pair.pairAddress)) {
       seenPairs.add(pair.pairAddress);
       uniquePairs.push(pair);
+      lastScanPairMap.set(pair.pairAddress, pair);
     }
   }
 
@@ -233,24 +258,30 @@ async function fetchAllTokenSources(): Promise<DexPair[]> {
 }
 
 async function fetchPairPrice(pairAddress: string, chainId?: string): Promise<DexPair | null> {
+  // First check scan data cache (avoids extra API call)
+  const cached = lastScanPairMap.get(pairAddress);
+  if (cached) return cached;
+
   try {
     if (chainId) {
-      const res = await trackedFetch(`${DEX_API}/latest/dex/pairs/${chainId}/${pairAddress}`);
-      if (res.ok) {
-        const data = await res.json();
-        const pairs = data.pairs || (Array.isArray(data) ? data : []);
-        if (pairs.length > 0) return pairs[0];
-      }
+      const data = await dexFetchCached(
+        `${DEX_API}/latest/dex/pairs/${chainId}/${pairAddress}`,
+        15_000, // 15s cache for position monitoring
+        "high" // Position monitoring is high priority
+      );
+      const pairs = data?.pairs || (Array.isArray(data) ? data : []);
+      if (pairs.length > 0) return pairs[0];
     }
     const chains = chainId ? [] : ["solana", "ethereum", "bsc", "base", "arbitrum"];
     for (const chain of chains) {
       try {
-        const res = await trackedFetch(`${DEX_API}/latest/dex/pairs/${chain}/${pairAddress}`);
-        if (res.ok) {
-          const data = await res.json();
-          const pairs = data.pairs || (Array.isArray(data) ? data : []);
-          if (pairs.length > 0) return pairs[0];
-        }
+        const data = await dexFetchCached(
+          `${DEX_API}/latest/dex/pairs/${chain}/${pairAddress}`,
+          15_000,
+          "high"
+        );
+        const pairs = data?.pairs || (Array.isArray(data) ? data : []);
+        if (pairs.length > 0) return pairs[0];
       } catch { /* try next */ }
     }
     return null;
@@ -259,7 +290,7 @@ async function fetchPairPrice(pairAddress: string, chainId?: string): Promise<De
   }
 }
 
-// ─── TOKEN QUALIFICATION (ALL 9+ RULES) ─────────────────────
+// ─── TOKEN QUALIFICATION (ALL 9+ RULES + SOCIAL + WHALE) ────
 
 export function qualifyToken(pair: DexPair, learnedAdjustments?: Map<string, number>): QualificationResult {
   const reasons: string[] = [];
@@ -406,6 +437,42 @@ export function qualifyToken(pair: DexPair, learnedAdjustments?: Map<string, num
     reasons.push(`Active trading: ${totalTxnsH1} txns H1`);
   }
 
+  // ── DIMENSION 10: Social Sentiment ──
+  const socialSignals = extractSocialSignals(pair);
+  const { score: socialScore, factors: socialFactors } = calculateSocialScore(socialSignals);
+  const socialRiskFlags = getSocialRiskFlags(socialSignals);
+
+  // Normalize social score (0-100) to conviction adjustment (-5 to +10)
+  const socialAdj = Math.round((socialScore / 100) * 15) - 5;
+  score += socialAdj;
+  if (socialAdj !== 0) {
+    reasons.push(`Social: ${socialAdj > 0 ? "+" : ""}${socialAdj} (${socialFactors.slice(0, 2).join(", ")})`);
+  }
+  if (socialRiskFlags.includes("NO_SOCIALS")) {
+    score -= 5;
+    reasons.push("Social risk: no social links");
+  }
+
+  // ── DIMENSION 11: Whale Activity ──
+  const whaleSignals = analyzeWhaleActivity(pair);
+  const { score: whaleScore, factors: whaleFactors } = calculateWhaleScore(whaleSignals);
+  const whaleRiskFlags = getWhaleRiskFlags(whaleSignals, pair);
+
+  // Normalize whale score (0-100) to conviction adjustment (-5 to +10)
+  const whaleAdj = Math.round((whaleScore / 100) * 15) - 5;
+  score += whaleAdj;
+  if (whaleAdj !== 0) {
+    reasons.push(`Whale: ${whaleAdj > 0 ? "+" : ""}${whaleAdj} (${whaleFactors.slice(0, 2).join(", ")})`);
+  }
+  if (whaleRiskFlags.includes("DUMP_PATTERN")) {
+    score -= 10;
+    reasons.push("Whale risk: dump pattern detected");
+  }
+  if (whaleRiskFlags.includes("HEAVY_SELLING")) {
+    score -= 5;
+    reasons.push("Whale risk: heavy selling pressure");
+  }
+
   // Learning adjustments
   if (learnedAdjustments && learnedAdjustments.size > 0) {
     const chainAdj = learnedAdjustments.get(`chain:${pair.chainId}`);
@@ -472,10 +539,13 @@ export async function runEngineCycle(userId: number = DEFAULT_USER_ID): Promise<
 }> {
   const cycleStartTime = Date.now();
   const errors: string[] = [];
-  let scanned = 0, qualified = 0, executed = 0, positionsUpdated = 0;
+  let scanned = 0;
+  let qualified = 0;
+  let executed = 0;
+  let positionsUpdated = 0;
 
   if (!acquireCycleLock()) {
-    return { scanned: 0, qualified: 0, executed: 0, positionsUpdated: 0, errors: ["Cycle skipped: previous still running"] };
+    return { scanned: 0, qualified: 0, executed: 0, positionsUpdated: 0, errors: ["Cycle locked"] };
   }
 
   try {
@@ -592,6 +662,10 @@ export async function runEngineCycle(userId: number = DEFAULT_USER_ID): Promise<
             tp1Price: tp1.toFixed(10),
             tp1Hit: false,
             tp1Partial: false,
+            tpEarlyHit: false,
+            tp2Hit: false,
+            originalPositionSize: posSize.toFixed(2),
+            sizeSoldPercent: "0",
             convictionScore: setup.score,
             entryReason: setup.reasons.join(" | "),
             entryVolume: (setup.pair.volume?.h24 ?? 0).toFixed(2),
@@ -604,7 +678,7 @@ export async function runEngineCycle(userId: number = DEFAULT_USER_ID): Promise<
         executed++;
 
         await notifyOwner({
-          title: `PAPER BUY — ${setup.pair.baseToken.symbol}`,
+          title: `📈 PAPER BUY — ${setup.pair.baseToken.symbol}`,
           content: `Entry: $${entryPrice.toFixed(8)} | Size: $${posSize.toFixed(2)} | SL: $${stopLoss.toFixed(8)} | TP1: $${tp1.toFixed(8)} | Score: ${setup.score}/100 | Chain: ${setup.pair.chainId}\nReasons: ${setup.reasons.join(", ")}`,
         }).catch(() => {});
       } catch (err: any) {
@@ -642,6 +716,12 @@ export async function runEngineCycle(userId: number = DEFAULT_USER_ID): Promise<
       "updateEngineState"
     );
 
+    // Log rate limiter metrics
+    const rlMetrics = getDexRateLimiterMetrics();
+    if (rlMetrics.rateLimitHits > 0 || rlMetrics.failedRequests > 0) {
+      console.log(`[RateLimiter] Requests: ${rlMetrics.totalRequests} | Failed: ${rlMetrics.failedRequests} | 429s: ${rlMetrics.rateLimitHits} | Queue: ${rlMetrics.currentQueueSize}`);
+    }
+
   } catch (err: any) {
     errors.push(`Cycle error: ${err.message}`);
   } finally {
@@ -665,7 +745,7 @@ export async function runEngineCycle(userId: number = DEFAULT_USER_ID): Promise<
   return { scanned, qualified, executed, positionsUpdated, errors };
 }
 
-// ─── POSITION MONITOR ───────────────────────────────────────
+// ─── POSITION MONITOR (4-TIER PROFIT-TAKING + ADAPTIVE TRAIL) ──
 
 // Track consecutive unfetchable price failures per position
 const unfetchableCounters = new Map<number, number>();
@@ -682,7 +762,6 @@ async function monitorPosition(pos: any, userId: number): Promise<boolean> {
     if (count >= CONFIG.unfetchableMaxRetries) {
       unfetchableCounters.delete(pos.id);
       const entryPrice = parseFloat(pos.entryPrice);
-      // Close at entry price (0 P&L) since we can't get real price
       return await closePosition(pos, userId, entryPrice, "closed",
         `Auto-closed: price data unavailable for ${count} consecutive checks`);
     }
@@ -712,66 +791,141 @@ async function monitorPosition(pos: any, userId: number): Promise<boolean> {
     lowestPrice: newLow.toFixed(10),
   };
 
-  // Break-even move
-  if (!pos.tp1Hit && pnlPercent >= dynamicParams.breakEvenThreshold) {
-    updateData.stopLossPrice = entryPrice.toFixed(10);
+  // ── 4-TIER PROFIT-TAKING SYSTEM ──
+  const origPosSize = pos.originalPositionSize ? parseFloat(pos.originalPositionSize) : posSize;
+  const currentSizeSold = parseFloat(pos.sizeSoldPercent ?? "0");
+
+  // Helper: execute a partial exit at a given tier
+  async function handlePartialExit(
+    sellRatio: number,
+    tierName: string,
+    tierUpdate: Record<string, any>
+  ): Promise<void> {
+    const sellAmount = origPosSize * sellRatio;
+    const partialPnl = sellAmount * (pnlPercent / 100);
+    const newSizeSold = currentSizeSold + sellRatio * 100;
+    const newPosSize = origPosSize * (1 - newSizeSold / 100);
+
+    // Return capital + profit to equity
+    const state = await withDbRetry(() => queries.getEngineState(userId), `getState_${tierName}`);
+    if (state) {
+      const newEquity = parseFloat(state.equity ?? "1000") + sellAmount + partialPnl;
+      const newDailyPnl = parseFloat(state.dailyPnlUsd ?? "0") + partialPnl;
+      await withDbRetry(
+        () => queries.upsertEngineState(userId, {
+          equity: newEquity.toFixed(2),
+          dailyPnlUsd: newDailyPnl.toFixed(2),
+        } as any),
+        `updateEquity_${tierName}`
+      );
+    }
+
+    // Update position
+    Object.assign(updateData, {
+      positionSizeUsd: newPosSize.toFixed(2),
+      sizeSoldPercent: newSizeSold.toFixed(2),
+      ...tierUpdate,
+    });
+
     await notifyOwner({
-      title: `BREAK-EVEN — ${pos.tokenSymbol}`,
-      content: `Stop moved to break-even. Current: $${currentPrice.toFixed(8)} (+${pnlPercent.toFixed(1)}%)`,
+      title: `🎯 ${tierName} — ${pos.tokenSymbol} +${pnlPercent.toFixed(1)}%`,
+      content: `Sold ${(sellRatio * 100).toFixed(0)}% ($${sellAmount.toFixed(2)}) at $${currentPrice.toFixed(8)}. P&L: $${partialPnl.toFixed(2)}. Remaining: $${newPosSize.toFixed(2)} (${(100 - newSizeSold).toFixed(0)}%)`,
     }).catch(() => {});
   }
 
-  // TP1 hit — take 50% partial
-  if (!pos.tp1Hit && currentPrice >= tp1) {
-    updateData.tp1Hit = true;
-    updateData.tp1Partial = true;
-    const partialProfit = posSize * 0.5 * (pnlPercent / 100);
-    updateData.positionSizeUsd = (posSize * 0.5).toFixed(2);
-    updateData.stopLossPrice = entryPrice.toFixed(10); // Move to BE
-
-    await notifyOwner({
-      title: `TP1 HIT — ${pos.tokenSymbol} +${pnlPercent.toFixed(1)}%`,
-      content: `Took 50% profit ($${partialProfit.toFixed(2)}). Remaining with BE stop.`,
-    }).catch(() => {});
+  // Tier 1: Early Profit at +12% — sell 20%, lock SL at entry+2% (NEVER breakeven)
+  if (!pos.tpEarlyHit && pnlPercent >= dynamicParams.tpEarlyPercent) {
+    const profitLockPrice = entryPrice * (1 + dynamicParams.earlyProfitLockPercent / 100);
+    const newSL = Math.max(stopLoss, profitLockPrice);
+    await handlePartialExit(dynamicParams.tpEarlySellRatio, "EARLY PROFIT", {
+      tpEarlyHit: true,
+      stopLossPrice: newSL.toFixed(10),
+    });
+    updateData.stopLossPrice = newSL.toFixed(10);
   }
 
-  // Stop loss
+  // Tier 2: TP1 at +20% — sell 25%, tighten trailing
+  if (!pos.tp1Hit && pnlPercent >= dynamicParams.tp1Percent) {
+    await handlePartialExit(dynamicParams.tp1SellRatio, "TP1 HIT", { tp1Hit: true });
+  }
+
+  // Tier 3: TP2 at +40% — sell 25%, very tight trailing
+  if (!pos.tp2Hit && pnlPercent >= dynamicParams.tp2Percent) {
+    await handlePartialExit(dynamicParams.tp2SellRatio, "TP2 HIT", { tp2Hit: true });
+  }
+
+  // Check if position is fully sold (100% exited via partial takes)
+  const totalSold = parseFloat(updateData.sizeSoldPercent ?? pos.sizeSoldPercent ?? "0");
+  if (totalSold >= 99.9) {
+    return await closePosition(pos, userId, currentPrice, "tp_hit", "Fully exited via tiered profit-taking");
+  }
+
+  // ── Rule 1: Stop loss hit ──
   if (currentPrice <= stopLoss) {
     return await closePosition(pos, userId, currentPrice, "stopped_out", `Stop loss hit`);
   }
 
-  // Circuit breaker
+  // ── Circuit breaker ──
   if (pnlPercent < -dynamicParams.circuitBreakerPct) {
     return await closePosition(pos, userId, currentPrice, "stopped_out", `CIRCUIT BREAKER: -${Math.abs(pnlPercent).toFixed(1)}% crash`);
   }
 
-  // Dynamic trailing stop
+  // ── ADAPTIVE TRAILING STOP (tightens with profit + tier + momentum fade) ──
   if (newHighWater > entryPrice) {
     const dropFromHigh = ((newHighWater - currentPrice) / newHighWater) * 100;
     const gainFromEntry = ((newHighWater - entryPrice) / entryPrice) * 100;
 
-    let trailPercent: number;
-    if (gainFromEntry > 50) {
-      trailPercent = dynamicParams.trailBigWin;
-    } else if (pos.tp1Hit) {
-      trailPercent = dynamicParams.trailPostTp1;
-    } else {
-      trailPercent = dynamicParams.trailPreTp1;
+    // Base trail: starts at trailInitial%, tightens by 1% per trailGainIncrement% gain
+    const gainTiers = Math.floor(gainFromEntry / dynamicParams.trailGainIncrement);
+    let trailPercent = dynamicParams.trailInitial - gainTiers;
+
+    // Additional tightening per profit-taking tier reached
+    const tp2Active = pos.tp2Hit || (updateData.tp2Hit === true);
+    const tp1Active = pos.tp1Hit || (updateData.tp1Hit === true);
+    const earlyActive = pos.tpEarlyHit || (updateData.tpEarlyHit === true);
+    if (tp2Active) {
+      trailPercent -= 3; // Very tight after TP2
+    } else if (tp1Active) {
+      trailPercent -= 2; // Tight after TP1
+    } else if (earlyActive) {
+      trailPercent -= 1; // Slightly tighter after early profit
+    }
+
+    // Momentum fade: tighten if volume or buy pressure dropping
+    const currentVolH1 = pair.volume?.h1 ?? 0;
+    const entryVolume = parseFloat(pos.entryVolume ?? "0");
+    if (entryVolume > 0 && currentVolH1 < entryVolume * 0.3) {
+      trailPercent -= 2; // Volume fading
+    }
+    const m5Buys = pair.txns?.m5?.buys ?? 0;
+    const m5Sells = pair.txns?.m5?.sells ?? 0;
+    if ((m5Buys + m5Sells) > 0 && m5Buys / (m5Buys + m5Sells) < 0.4) {
+      trailPercent -= 1; // Sell pressure increasing
+    }
+
+    // Floor: never trail less than trailMinPercent (default 4%)
+    trailPercent = Math.max(trailPercent, dynamicParams.trailMinPercent);
+
+    // SL Ratchet: calculate new stop from high, only apply if higher than current
+    const trailStopPrice = newHighWater * (1 - trailPercent / 100);
+    if (trailStopPrice > stopLoss) {
+      updateData.stopLossPrice = trailStopPrice.toFixed(10);
     }
 
     if (dropFromHigh > trailPercent && pnlPercent > 0) {
-      return await closePosition(pos, userId, currentPrice, "closed", `Trailing stop: -${dropFromHigh.toFixed(1)}% from high`);
+      return await closePosition(pos, userId, currentPrice, "closed",
+        `Adaptive trail ${trailPercent.toFixed(1)}%: -${dropFromHigh.toFixed(1)}% from high ($${newHighWater.toFixed(8)})`);
     }
   }
 
-  // Volume dry-up
+  // ── Volume dry-up ──
   const currentVolH1 = pair.volume?.h1 ?? 0;
   const entryVolume = parseFloat(pos.entryVolume ?? "0");
   if (entryVolume > 0 && currentVolH1 < entryVolume * dynamicParams.volDryUpThreshold && pnlPercent > 5) {
     return await closePosition(pos, userId, currentPrice, "closed", `Volume dry-up exit`);
   }
 
-  // ─── STALE POSITION AUTO-CLOSE ────────────────────────────
+  // ── STALE POSITION AUTO-CLOSE ────────────────────────────
   if (pos.openedAt) {
     const holdDurationMs = Date.now() - new Date(pos.openedAt).getTime();
     const absPnlPct = Math.abs(pnlPercent);
@@ -816,6 +970,43 @@ async function closePosition(
     `closePos_${pos.id}`
   );
 
+  // Update engine state: return remaining position size + P&L to equity
+  const state = await withDbRetry(() => queries.getEngineState(userId), "getState_close");
+  if (state) {
+    const newEquity = parseFloat(state.equity ?? "1000") + posSize + pnlUsd;
+    const newDailyPnl = parseFloat(state.dailyPnlUsd ?? "0") + pnlUsd;
+    const newConsecLosses = isWin ? 0 : (state.consecutiveLosses ?? 0) + 1;
+
+    const updateObj: any = {
+      equity: newEquity.toFixed(2),
+      dailyPnlUsd: newDailyPnl.toFixed(2),
+      consecutiveLosses: newConsecLosses,
+      totalTrades: (state.totalTrades ?? 0) + 1,
+      totalPnlUsd: (parseFloat(state.totalPnlUsd ?? "0") + pnlUsd).toFixed(2),
+    };
+
+    if (newEquity > parseFloat(state.peakEquity ?? "1000")) {
+      updateObj.peakEquity = newEquity.toFixed(2);
+    }
+
+    await withDbRetry(
+      () => queries.upsertEngineState(userId, updateObj),
+      "updateState_close"
+    );
+
+    // Create equity snapshot
+    try {
+      await withDbRetry(
+        () => queries.createEquitySnapshot({
+          userId,
+          equity: newEquity.toFixed(2),
+          dailyPnl: newDailyPnl.toFixed(2),
+        }),
+        "createSnapshot"
+      );
+    } catch { /* non-critical */ }
+  }
+
   // Log to trades
   try {
     await withDbRetry(
@@ -844,7 +1035,6 @@ async function closePosition(
   try {
     const holdTimeMin = pos.openedAt ? (Date.now() - new Date(pos.openedAt).getTime()) / 60000 : 0;
 
-    // Update patterns
     const patternUpdates = [
       { type: "chain", value: pos.chain },
       { type: "conviction_range", value: `${Math.floor(pos.convictionScore / 10) * 10}-${Math.floor(pos.convictionScore / 10) * 10 + 9}` },
@@ -853,7 +1043,7 @@ async function closePosition(
 
     for (const p of patternUpdates) {
       await queries.upsertTradePattern(userId, p.type, p.value, {
-        totalTrades: 1, // Will be incremented in upsert
+        totalTrades: 1,
         wins: isWin ? 1 : 0,
         losses: isWin ? 0 : 1,
         avgPnlPercent: pnlPercent.toFixed(2),
@@ -875,9 +1065,10 @@ async function closePosition(
   } catch { /* non-critical */ }
 
   // Notify
-  const emoji = isWin ? "PROFIT" : "LOSS";
+  const emoji = isWin ? "💰 PROFIT" : "📉 LOSS";
+  const tierInfo = pos.tp2Hit ? " (TP2+)" : pos.tp1Hit ? " (TP1+)" : pos.tpEarlyHit ? " (Early+)" : "";
   await notifyOwner({
-    title: `${emoji} — ${pos.tokenSymbol} ${pnlPercent >= 0 ? "+" : ""}${pnlPercent.toFixed(1)}%`,
+    title: `${emoji} — ${pos.tokenSymbol} ${pnlPercent >= 0 ? "+" : ""}${pnlPercent.toFixed(1)}%${tierInfo}`,
     content: `Closed: $${pnlUsd.toFixed(2)} | Exit: $${exitPrice.toFixed(8)} | Reason: ${reason}`,
   }).catch(() => {});
 
@@ -896,6 +1087,7 @@ export function startEngine(userId: number = DEFAULT_USER_ID) {
 
   running = true;
   console.log(`[Engine] Starting for user ${userId}, interval: ${CONFIG.scanIntervalMs}ms`);
+  console.log(`[Engine] Features: rate-limiter, 4-tier profit-taking, adaptive trailing, social+whale scoring`);
 
   // Register self-heal
   setSelfHealCallback(async () => {

@@ -86,6 +86,10 @@ const migrations = [
     tp1_price TEXT,
     tp1_hit INTEGER DEFAULT 0,
     tp1_partial INTEGER DEFAULT 0,
+    tp_early_hit INTEGER DEFAULT 0,
+    tp2_hit INTEGER DEFAULT 0,
+    original_position_size TEXT,
+    size_sold_percent TEXT DEFAULT '0',
     entry_volume TEXT,
     entry_liquidity TEXT,
     entry_fdv TEXT,
@@ -201,6 +205,15 @@ const migrations = [
     trail_big_win TEXT DEFAULT '6',
     stop_loss_percent TEXT DEFAULT '10',
     tp1_percent TEXT DEFAULT '25',
+    tp2_percent TEXT DEFAULT '40',
+    tp_early_percent TEXT DEFAULT '12',
+    tp_early_sell_ratio TEXT DEFAULT '0.20',
+    tp1_sell_ratio TEXT DEFAULT '0.25',
+    tp2_sell_ratio TEXT DEFAULT '0.25',
+    trail_initial TEXT DEFAULT '10',
+    trail_gain_increment TEXT DEFAULT '5',
+    trail_min_percent TEXT DEFAULT '4',
+    early_profit_lock_percent TEXT DEFAULT '2',
     break_even_threshold TEXT DEFAULT '15',
     min_risk_percent TEXT DEFAULT '1.0',
     max_risk_percent TEXT DEFAULT '2.5',
@@ -236,6 +249,22 @@ const migrations = [
     analysis_summary TEXT,
     run_at INTEGER DEFAULT (unixepoch() * 1000)
   )`,
+  // ─── ADDITIVE MIGRATIONS for existing databases ─────────────
+  // These ALTER TABLE statements add new columns to existing tables.
+  // They use try/catch because the column may already exist.
+  `ALTER TABLE paper_positions ADD COLUMN tp_early_hit INTEGER DEFAULT 0`,
+  `ALTER TABLE paper_positions ADD COLUMN tp2_hit INTEGER DEFAULT 0`,
+  `ALTER TABLE paper_positions ADD COLUMN original_position_size TEXT`,
+  `ALTER TABLE paper_positions ADD COLUMN size_sold_percent TEXT DEFAULT '0'`,
+  `ALTER TABLE engine_params ADD COLUMN tp2_percent TEXT DEFAULT '40'`,
+  `ALTER TABLE engine_params ADD COLUMN tp_early_percent TEXT DEFAULT '12'`,
+  `ALTER TABLE engine_params ADD COLUMN tp_early_sell_ratio TEXT DEFAULT '0.20'`,
+  `ALTER TABLE engine_params ADD COLUMN tp1_sell_ratio TEXT DEFAULT '0.25'`,
+  `ALTER TABLE engine_params ADD COLUMN tp2_sell_ratio TEXT DEFAULT '0.25'`,
+  `ALTER TABLE engine_params ADD COLUMN trail_initial TEXT DEFAULT '10'`,
+  `ALTER TABLE engine_params ADD COLUMN trail_gain_increment TEXT DEFAULT '5'`,
+  `ALTER TABLE engine_params ADD COLUMN trail_min_percent TEXT DEFAULT '4'`,
+  `ALTER TABLE engine_params ADD COLUMN early_profit_lock_percent TEXT DEFAULT '2'`,
 ];
 
 /**
