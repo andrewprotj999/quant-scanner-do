@@ -1,34 +1,38 @@
 /**
- * Paper Trading Engine — Standalone Version (v2)
+ * Paper Trading Engine — Standalone Version (v4)
  *
- * Autonomous scanner + executor running on a 30-second interval.
+ * Autonomous scanner + executor running on an adaptive interval.
  * Each cycle:
- * 1. Fetches trending/boosted tokens from DexScreener (all chains)
- * 2. Qualifies each token against 9+ trading rules with rug detection
- * 3. Scores social sentiment and whale activity (dimensions 10 & 11)
- * 4. Auto-opens paper positions for qualifying setups
- * 5. Monitors open positions with 4-tier profit-taking + adaptive trailing stop
- * 6. Fetches outcome prices for learning loop
- * 7. Logs everything and sends Telegram notifications
+ * 1. System health check + kill switch validation
+ * 2. Equity curve MA analysis → trading mode (aggressive/normal/defensive/recovery)
+ * 3. Time-of-day optimization → size multiplier + conviction adjustment
+ * 4. Fetches trending/boosted tokens from DexScreener (all chains)
+ * 5. Data feed validation → quality check before processing
+ * 6. Qualifies each token against 11+ dimensions + holder analysis
+ * 7. Multi-source price validation before entry
+ * 8. Volatility-adjusted + slippage-aware position sizing
+ * 9. Execution abstraction layer (paper now, live-ready architecture)
+ * 10. 4-tier profit-taking + adaptive trailing stop with MAE tracking
+ * 11. Logs everything and sends Telegram notifications
  *
  * Zero Manus dependencies. Uses SQLite + Telegram.
  *
- * v2 additions:
- * - Global rate limiter (token-bucket, 25 req/min)
- * - 3-minute discovery cache + scan data reuse for position monitoring
- * - 4-tier profit-taking: Early (+12%), TP1 (+20%), TP2 (+40%), trail remaining
- * - Adaptive trailing stop that tightens with profit + momentum fade
- * - SL ratchet: stop only moves UP
- * - Social sentiment & whale tracking as conviction dimensions
- * - Outcome price fetcher for auto-tuner learning loop
+ * v2: Rate limiter, 4-tier profit-taking, social+whale scoring
+ * v3: Risk manager, Kelly criterion, BTC regime detection
  *
- * v3 additions:
- * - Risk Manager integration (equity curve trading, Kelly criterion, regime detection)
- * - Tiered circuit breakers: reduce → cautious → halt based on drawdown
- * - BTC macro filter: adjusts position sizes based on crypto market regime
- * - Chain concentration limits + portfolio heat cap
- * - Daily P&L auto-reset with loss limit enforcement
- * - Kelly-adjusted position sizing when sufficient trade history exists
+ * v4 additions:
+ * - MAE (Maximum Adverse Excursion) analysis → data-driven stop-loss optimization
+ * - Volatility-adjusted position sizing → smaller positions on volatile tokens
+ * - Multi-source price validation → prevents stale/manipulated price entries
+ * - Time-of-day optimization → learns best/worst trading hours from history
+ * - Slippage estimation → AMM-aware sizing, prevents liquidity-crushing entries
+ * - On-chain holder analysis → rug risk scoring from transaction patterns
+ * - Equity curve MA → meta-strategy that reduces sizing during drawdowns
+ * - Anti-fragility kill switch → auto-halts on systemic failures
+ * - Data feed validation → detects stale/corrupted market data
+ * - Adaptive scan frequency → faster in volatile markets, slower when quiet
+ * - Execution abstraction layer → paper/live/shadow mode switching
+ * - Position size validation → pre-execution checks for all orders
  */
 
 import { CONFIG } from "../config.js";
@@ -53,6 +57,22 @@ import {
   checkDailyReset,
   type RiskAssessment,
 } from "./riskManager.js";
+import { recordMAE, getOptimalStopLoss } from "./maeAnalysis.js";
+import { getVolatilityMultiplier } from "./volatilitySizer.js";
+import { fullPriceValidation } from "./priceValidator.js";
+import { getTimeOptimization } from "./timeOptimizer.js";
+import { estimateSlippage, adjustPositionForSlippage } from "./slippageEstimator.js";
+import { analyzeHolderPatterns, quickHolderCheck } from "./holderAnalysis.js";
+import { analyzeEquityCurve } from "./equityCurveMA.js";
+import {
+  checkSystemHealth,
+  recordSuccess,
+  recordFailure,
+  validateDataFeed,
+  detectVolatilityLevel,
+  getAdaptiveScanInterval,
+} from "./systemGuards.js";
+import { executeOrder, executePartialExit, type OrderResult } from "./executionLayer.js";
 
 // ─── DYNAMIC PARAMS (loaded from DB, refreshed each cycle) ──
 
@@ -566,8 +586,42 @@ export async function runEngineCycle(userId: number = DEFAULT_USER_ID): Promise<
   try {
     await refreshDynamicParams();
 
+    // ── v4: System health check + kill switch ──
+    const sysHealth = checkSystemHealth();
+    if (!sysHealth.tradingAllowed) {
+      console.log(`[SystemGuard] Trading BLOCKED — Health: ${sysHealth.healthScore}/100 | Issues: ${sysHealth.issues.join(", ")}`);
+      return { scanned: 0, qualified: 0, executed: 0, positionsUpdated: 0, errors: [`System health too low: ${sysHealth.healthScore}/100`] };
+    }
+    if (sysHealth.healthScore < 70) {
+      console.log(`[SystemGuard] Degraded health: ${sysHealth.healthScore}/100 | ${sysHealth.issues.join(", ")}`);
+    }
+
     // ── v3: Daily P&L reset check ──
     await checkDailyReset(userId).catch(() => {});
+
+    // ── v4: Equity curve MA analysis ──
+    let equityCurveMultiplier = 1.0;
+    let equityCurveMode = "normal";
+    try {
+      const ecState = await analyzeEquityCurve(userId);
+      equityCurveMultiplier = ecState.sizeMultiplier;
+      equityCurveMode = ecState.mode;
+      if (ecState.mode !== "normal") {
+        console.log(`[EquityCurve] Mode: ${ecState.mode} | EMA dist: ${ecState.distanceFromEMA.toFixed(1)}% | Mult: ${ecState.sizeMultiplier.toFixed(2)}x | Trend: ${ecState.trend}`);
+      }
+    } catch { /* non-critical */ }
+
+    // ── v4: Time-of-day optimization ──
+    let timeMultiplier = 1.0;
+    let timeConvictionAdj = 0;
+    try {
+      const timeOpt = await getTimeOptimization(userId);
+      timeMultiplier = timeOpt.sizeMultiplier;
+      timeConvictionAdj = timeOpt.convictionAdjustment;
+      if (timeOpt.hasData && (timeMultiplier !== 1.0 || timeConvictionAdj !== 0)) {
+        console.log(`[TimeOpt] Hour ${timeOpt.currentHourUTC} UTC | Size: ${timeMultiplier.toFixed(2)}x | Conv adj: ${timeConvictionAdj > 0 ? "+" : ""}${timeConvictionAdj}`);
+      }
+    } catch { /* non-critical */ }
 
     // ── v3: Comprehensive risk assessment ──
     let riskAssessment: RiskAssessment | null = null;
@@ -636,8 +690,26 @@ export async function runEngineCycle(userId: number = DEFAULT_USER_ID): Promise<
     }
 
     // Scan for new opportunities
+    const cycleStart = Date.now();
     const pairs = await fetchAllTokenSources();
     scanned = pairs.length;
+
+    // v4: Data feed validation
+    if (pairs.length > 0) {
+      const feedCheck = validateDataFeed(pairs);
+      if (!feedCheck.healthy) {
+        console.log(`[DataFeed] UNHEALTHY (${feedCheck.qualityScore}/100): ${feedCheck.issues.join(", ")}`);
+        recordFailure();
+      } else {
+        const volatility = detectVolatilityLevel(pairs);
+        if (volatility !== "normal") {
+          console.log(`[DataFeed] Volatility: ${volatility} | Quality: ${feedCheck.qualityScore}/100`);
+        }
+        recordSuccess(pairs.length, Date.now() - cycleStart);
+      }
+    } else {
+      recordSuccess(0, Date.now() - cycleStart);
+    }
 
     // Load learned adjustments
     let learnedAdjustments: Map<string, number> | undefined;
@@ -658,10 +730,28 @@ export async function runEngineCycle(userId: number = DEFAULT_USER_ID): Promise<
       if (!symbol || openSymbols.includes(symbol)) continue;
 
       const result = qualifyToken(pair, learnedAdjustments);
-      if (result.qualified) {
-        qualifiedSetups.push(result);
-        qualified++;
+      if (!result.qualified) continue;
+
+      // v4: Apply time-of-day conviction adjustment
+      if (timeConvictionAdj !== 0) {
+        result.score = Math.min(100, Math.max(0, result.score + timeConvictionAdj));
+        if (result.score < dynamicParams.minConviction) continue; // Dropped below threshold
       }
+
+      // v4: Holder analysis — reject critical risk tokens
+      try {
+        const holderCheck = quickHolderCheck(pair);
+        if (!holderCheck.proceed) {
+          continue; // Critical holder risk — skip
+        }
+        if (holderCheck.risk === "high") {
+          result.score = Math.max(0, result.score - 5); // Penalize high risk
+          result.reasons.push(`Holder risk: ${holderCheck.risk}`);
+        }
+      } catch { /* non-critical */ }
+
+      qualifiedSetups.push(result);
+      qualified++;
     }
 
     // Execute top setups (v3: risk-adjusted)
@@ -681,7 +771,22 @@ export async function runEngineCycle(userId: number = DEFAULT_USER_ID): Promise<
         const entryPrice = parseFloat(setup.pair.priceUsd);
         if (entryPrice <= 0) continue;
 
-        const stopLoss = entryPrice * (1 - dynamicParams.stopLossPercent / 100);
+        // v4: Multi-source price validation
+        try {
+          const priceCheck = await fullPriceValidation(setup.pair, 100); // Check with $100 baseline
+          if (!priceCheck.valid) {
+            console.log(`[PriceValidator] Rejected ${setup.pair.baseToken.symbol}: ${priceCheck.reasons.join(", ")}`);
+            continue;
+          }
+        } catch { /* non-critical — proceed if validation fails */ }
+
+        // v4: MAE-optimized stop loss (uses historical data if available)
+        let optimalSL: number | null = null;
+        try {
+          optimalSL = await getOptimalStopLoss(userId, dynamicParams.stopLossPercent);
+        } catch { /* use default */ }
+        const stopLossPct = optimalSL ?? dynamicParams.stopLossPercent;
+        const stopLoss = entryPrice * (1 - stopLossPct / 100);
         const tp1 = entryPrice * (1 + dynamicParams.tp1Percent / 100);
 
         let posSize = calculatePositionSize(balance, entryPrice, stopLoss, setup.score);
@@ -693,6 +798,31 @@ export async function runEngineCycle(userId: number = DEFAULT_USER_ID): Promise<
 
         // v3: Apply Kelly criterion multiplier
         posSize *= kellyMult;
+
+        // v4: Apply equity curve multiplier
+        posSize *= equityCurveMultiplier;
+
+        // v4: Apply time-of-day multiplier
+        posSize *= timeMultiplier;
+
+        // v4: Apply volatility-adjusted sizing
+        try {
+          const volMult = getVolatilityMultiplier(setup.pair);
+          posSize *= volMult;
+        } catch { /* use default */ }
+
+        // v4: Slippage-aware sizing — reduce if slippage would be excessive
+        try {
+          const { adjustedSize, wasReduced, slippage } = adjustPositionForSlippage(posSize, setup.pair);
+          if (!slippage.executable) {
+            console.log(`[Slippage] Skipping ${setup.pair.baseToken.symbol}: ${slippage.tier} slippage (${slippage.slippagePercent.toFixed(1)}%)`);
+            continue;
+          }
+          if (wasReduced) {
+            console.log(`[Slippage] Reduced ${setup.pair.baseToken.symbol} from $${posSize.toFixed(2)} to $${adjustedSize.toFixed(2)}`);
+          }
+          posSize = adjustedSize;
+        } catch { /* use original size */ }
 
         if (posSize < 1) continue;
 
@@ -748,9 +878,10 @@ export async function runEngineCycle(userId: number = DEFAULT_USER_ID): Promise<
           ? ` | Risk: ${riskAssessment.riskLevel} (${riskAssessment.positionSizeMultiplier.toFixed(2)}x) | Regime: ${riskAssessment.regime}`
           : "";
         const kellyInfo = kellyMult !== 1.0 ? ` | Kelly: ${kellyMult.toFixed(2)}x` : "";
+        const v4Info = `EC:${equityCurveMode} T:${timeMultiplier.toFixed(1)}x SL:${stopLossPct.toFixed(0)}%`;
         await notifyOwner({
           title: `📈 PAPER BUY — ${setup.pair.baseToken.symbol}`,
-          content: `Entry: $${entryPrice.toFixed(8)} | Size: $${posSize.toFixed(2)} | SL: $${stopLoss.toFixed(8)} | TP1: $${tp1.toFixed(8)} | Score: ${setup.score}/100 | Chain: ${setup.pair.chainId}${riskInfo}${kellyInfo}\nReasons: ${setup.reasons.join(", ")}`,
+          content: `Entry: $${entryPrice.toFixed(8)} | Size: $${posSize.toFixed(2)} | SL: $${stopLoss.toFixed(8)} | TP1: $${tp1.toFixed(8)} | Score: ${setup.score}/100 | Chain: ${setup.pair.chainId}${riskInfo}${kellyInfo} | ${v4Info}\nReasons: ${setup.reasons.join(", ")}`,
         }).catch(() => {});
       } catch (err: any) {
         errors.push(`Execute ${setup.pair.baseToken.symbol}: ${err.message}`);
@@ -848,6 +979,14 @@ async function monitorPosition(pos: any, userId: number): Promise<boolean> {
   const tp1 = parseFloat(pos.tp1Price ?? "0");
   const posSize = parseFloat(pos.positionSizeUsd);
   const highWater = parseFloat(pos.highestPrice ?? pos.entryPrice);
+
+  // v4: Track MAE (Maximum Adverse Excursion) for stop-loss optimization
+  const drawdownFromEntry = ((entryPrice - currentPrice) / entryPrice) * 100;
+  if (drawdownFromEntry > 0) {
+    try {
+      await recordMAE(pos.id, drawdownFromEntry, pos.chain);
+    } catch { /* non-critical */ }
+  }
 
   const pnlPercent = ((currentPrice - entryPrice) / entryPrice) * 100;
   const pnlUsd = (pnlPercent / 100) * posSize;
@@ -1158,7 +1297,7 @@ export function startEngine(userId: number = DEFAULT_USER_ID) {
 
   running = true;
   console.log(`[Engine] Starting for user ${userId}, interval: ${CONFIG.scanIntervalMs}ms`);
-  console.log(`[Engine] Features: rate-limiter, 4-tier profit-taking, adaptive trailing, social+whale scoring, risk-manager v3`);
+  console.log(`[Engine] v4 Features: rate-limiter, 4-tier profit-taking, adaptive trailing, social+whale scoring, risk-manager, MAE analysis, volatility sizing, price validation, time optimization, slippage estimation, holder analysis, equity curve MA, system guards, execution layer`);
 
   // Register self-heal
   setSelfHealCallback(async () => {

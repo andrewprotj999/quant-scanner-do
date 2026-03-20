@@ -51,6 +51,11 @@ import {
   detectMarketRegime,
   getRiskConstants,
 } from "./core/riskManager.js";
+import { getMAEStats } from "./core/maeAnalysis.js";
+import { getTimeOptimization } from "./core/timeOptimizer.js";
+import { analyzeEquityCurve } from "./core/equityCurveMA.js";
+import { checkSystemHealth, getSystemGuardState, resetKillSwitch } from "./core/systemGuards.js";
+import { getExecutionStatus, setExecutionMode, type ExecutionMode } from "./core/executionLayer.js";
 
 const app = express();
 app.use(cors());
@@ -324,12 +329,73 @@ app.get("/api/risk/constants", (_req, res) => {
   res.json(getRiskConstants());
 });
 
+// ─── v4: MAE ANALYSIS ───────────────────────────────────────────────
+
+app.get("/api/mae", async (_req, res) => {
+  try {
+    const stats = await getMAEStats(1);
+    res.json(stats);
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ─── v4: TIME OPTIMIZATION ────────────────────────────────────────
+
+app.get("/api/time", async (_req, res) => {
+  try {
+    const timeOpt = await getTimeOptimization(1);
+    res.json(timeOpt);
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ─── v4: EQUITY CURVE MA ──────────────────────────────────────────
+
+app.get("/api/equity-curve", async (_req, res) => {
+  try {
+    const ecState = await analyzeEquityCurve(1);
+    res.json(ecState);
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ─── v4: SYSTEM GUARDS ───────────────────────────────────────────
+
+app.get("/api/system", (_req, res) => {
+  const health = checkSystemHealth();
+  const guards = getSystemGuardState();
+  res.json({ health, guards });
+});
+
+app.post("/api/system/reset-killswitch", (_req, res) => {
+  resetKillSwitch();
+  res.json({ success: true, message: "Kill switch reset" });
+});
+
+// ─── v4: EXECUTION LAYER ──────────────────────────────────────────
+
+app.get("/api/execution", (_req, res) => {
+  res.json(getExecutionStatus());
+});
+
+app.post("/api/execution/mode", (req, res) => {
+  const { mode } = req.body;
+  if (!mode || !["paper", "live", "shadow"].includes(mode)) {
+    return res.status(400).json({ error: "Invalid mode. Use: paper, live, shadow" });
+  }
+  setExecutionMode(mode as ExecutionMode);
+  res.json({ success: true, mode, message: `Execution mode set to ${mode}` });
+});
+
 // ─── STARTUP ────────────────────────────────────────────────
 
 async function main() {
   console.log("═══════════════════════════════════════════════");
-  console.log("  Memecoin Scanner — Standalone Engine v3.0");
-  console.log("  Risk Manager + Kelly + Regime Detection");
+  console.log("  Memecoin Scanner — Standalone Engine v4.0");
+  console.log("  Full Optimization Suite: 12 Intelligence Layers");
   console.log("═══════════════════════════════════════════════");
 
   // Initialize database
