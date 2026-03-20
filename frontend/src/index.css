@@ -1,0 +1,73 @@
+@import "tailwindcss";
+@import url("https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&family=Inter:wght@300;400;500;600;700&display=swap");
+
+@theme inline {
+  --color-primary: oklch(0.7 0.18 160);
+  --color-primary-foreground: oklch(0.15 0.02 160);
+  --color-background: oklch(0.13 0.01 260);
+  --color-foreground: oklch(0.95 0.01 260);
+  --color-card: oklch(0.17 0.01 260);
+  --color-card-foreground: oklch(0.95 0.01 260);
+  --color-muted: oklch(0.22 0.01 260);
+  --color-muted-foreground: oklch(0.6 0.01 260);
+  --color-border: oklch(0.25 0.01 260);
+  --color-input: oklch(0.22 0.01 260);
+  --color-ring: oklch(0.7 0.18 160);
+  --color-accent: oklch(0.25 0.01 260);
+  --color-accent-foreground: oklch(0.95 0.01 260);
+  --color-destructive: oklch(0.55 0.2 25);
+  --color-destructive-foreground: oklch(0.95 0.01 260);
+  --color-popover: oklch(0.17 0.01 260);
+  --color-popover-foreground: oklch(0.95 0.01 260);
+  --color-secondary: oklch(0.22 0.01 260);
+  --color-secondary-foreground: oklch(0.95 0.01 260);
+  --color-sidebar: oklch(0.11 0.015 260);
+  --color-sidebar-foreground: oklch(0.6 0.01 260);
+  --color-sidebar-accent: oklch(0.18 0.02 160);
+  --color-sidebar-accent-foreground: oklch(0.95 0.01 260);
+  --color-sidebar-border: oklch(0.2 0.01 260);
+  --font-sans: "Inter", ui-sans-serif, system-ui, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, monospace;
+  --radius-sm: 0.25rem;
+  --radius-md: 0.375rem;
+  --radius-lg: 0.5rem;
+  --radius-xl: 0.75rem;
+}
+
+@layer base {
+  *,
+  *::before,
+  *::after {
+    border-color: var(--color-border);
+  }
+
+  body {
+    background-color: var(--color-background);
+    color: var(--color-foreground);
+    font-family: var(--font-sans);
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+  }
+
+  /* Scrollbar styling */
+  ::-webkit-scrollbar {
+    width: 6px;
+    height: 6px;
+  }
+  ::-webkit-scrollbar-track {
+    background: transparent;
+  }
+  ::-webkit-scrollbar-thumb {
+    background: oklch(0.3 0.01 260);
+    border-radius: 3px;
+  }
+  ::-webkit-scrollbar-thumb:hover {
+    background: oklch(0.4 0.01 260);
+  }
+}
+
+/* Pulse animation for live indicators */
+@keyframes pulse-glow {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.5; }
+}
