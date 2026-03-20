@@ -21,6 +21,14 @@
  * - SL ratchet: stop only moves UP
  * - Social sentiment & whale tracking as conviction dimensions
  * - Outcome price fetcher for auto-tuner learning loop
+ *
+ * v3 additions:
+ * - Risk Manager integration (equity curve trading, Kelly criterion, regime detection)
+ * - Tiered circuit breakers: reduce → cautious → halt based on drawdown
+ * - BTC macro filter: adjusts position sizes based on crypto market regime
+ * - Chain concentration limits + portfolio heat cap
+ * - Daily P&L auto-reset with loss limit enforcement
+ * - Kelly-adjusted position sizing when sufficient trade history exists
  */
 
 import { CONFIG } from "../config.js";
@@ -38,6 +46,13 @@ import {
 import { dexFetch, dexFetchCached, getDexRateLimiterMetrics } from "./dexRateLimiter.js";
 import { extractSocialSignals, calculateSocialScore, getSocialRiskFlags } from "./socialSentiment.js";
 import { analyzeWhaleActivity, calculateWhaleScore, getWhaleRiskFlags } from "./whaleTracker.js";
+import {
+  assessRisk,
+  canEnterChain,
+  getKellyMultiplier,
+  checkDailyReset,
+  type RiskAssessment,
+} from "./riskManager.js";
 
 // ─── DYNAMIC PARAMS (loaded from DB, refreshed each cycle) ──
 
@@ -551,6 +566,23 @@ export async function runEngineCycle(userId: number = DEFAULT_USER_ID): Promise<
   try {
     await refreshDynamicParams();
 
+    // ── v3: Daily P&L reset check ──
+    await checkDailyReset(userId).catch(() => {});
+
+    // ── v3: Comprehensive risk assessment ──
+    let riskAssessment: RiskAssessment | null = null;
+    try {
+      riskAssessment = await assessRisk(userId);
+      if (riskAssessment.reasons.length > 0) {
+        console.log(`[RiskManager] ${riskAssessment.riskLevel.toUpperCase()} | Multiplier: ${riskAssessment.positionSizeMultiplier.toFixed(2)}x | ${riskAssessment.reasons.join(" | ")}`);
+      }
+      if (riskAssessment.riskLevel === "halted") {
+        console.log(`[RiskManager] HALTED — no new positions. Reasons: ${riskAssessment.reasons.join(", ")}`);
+      }
+    } catch (err: any) {
+      console.error(`[RiskManager] Assessment failed (using defaults): ${err.message}`);
+    }
+
     // Get or init engine state
     let state = await withDbRetry(() => queries.getEngineState(userId), "getEngineState");
     if (!state) {
@@ -589,13 +621,18 @@ export async function runEngineCycle(userId: number = DEFAULT_USER_ID): Promise<
       }
     }
 
-    // Check max positions
+    // Check max positions + v3 risk-based limits
     const currentOpenCount = (await withDbRetry(() => queries.getOpenPositions(userId), "getOpenCount")).length;
-    const maxPositions = CONFIG.maxPositions;
+    const maxPositions = riskAssessment
+      ? Math.min(CONFIG.maxPositions, riskAssessment.maxNewPositions + currentOpenCount)
+      : CONFIG.maxPositions;
 
     if (currentOpenCount >= maxPositions) {
-      console.log(`[Engine] Max ${maxPositions} positions — skipping scan`);
-      return { scanned: 0, qualified: 0, executed: 0, positionsUpdated, errors: [`Max ${maxPositions} positions`] };
+      const reason = riskAssessment?.riskLevel === "halted"
+        ? `Risk HALTED: ${riskAssessment.reasons.join(", ")}`
+        : `Max ${maxPositions} positions`;
+      console.log(`[Engine] ${reason} — skipping scan`);
+      return { scanned: 0, qualified: 0, executed: 0, positionsUpdated, errors: [reason] };
     }
 
     // Scan for new opportunities
@@ -627,9 +664,17 @@ export async function runEngineCycle(userId: number = DEFAULT_USER_ID): Promise<
       }
     }
 
-    // Execute top setups
-    const slotsAvailable = maxPositions - currentOpenCount;
-    const toExecute = qualifiedSetups.sort((a, b) => b.score - a.score).slice(0, slotsAvailable);
+    // Execute top setups (v3: risk-adjusted)
+    const slotsAvailable = riskAssessment
+      ? Math.min(maxPositions - currentOpenCount, riskAssessment.maxNewPositions)
+      : maxPositions - currentOpenCount;
+    const toExecute = qualifiedSetups.sort((a, b) => b.score - a.score).slice(0, Math.max(0, slotsAvailable));
+
+    // v3: Get Kelly multiplier for position sizing
+    let kellyMult = 1.0;
+    try {
+      kellyMult = await getKellyMultiplier(userId);
+    } catch { /* use default */ }
 
     for (const setup of toExecute) {
       try {
@@ -639,8 +684,29 @@ export async function runEngineCycle(userId: number = DEFAULT_USER_ID): Promise<
         const stopLoss = entryPrice * (1 - dynamicParams.stopLossPercent / 100);
         const tp1 = entryPrice * (1 + dynamicParams.tp1Percent / 100);
 
-        const posSize = calculatePositionSize(balance, entryPrice, stopLoss, setup.score);
+        let posSize = calculatePositionSize(balance, entryPrice, stopLoss, setup.score);
+
+        // v3: Apply risk manager multiplier (drawdown + regime + consecutive losses)
+        if (riskAssessment) {
+          posSize *= riskAssessment.positionSizeMultiplier;
+        }
+
+        // v3: Apply Kelly criterion multiplier
+        posSize *= kellyMult;
+
         if (posSize < 1) continue;
+
+        // v3: Check chain concentration limits
+        const chainCheck = canEnterChain(
+          setup.pair.chainId,
+          posSize,
+          openPositions,
+          balance
+        );
+        if (!chainCheck.allowed) {
+          console.log(`[RiskManager] Skipping ${setup.pair.baseToken.symbol}: ${chainCheck.reason}`);
+          continue;
+        }
 
         const tokenAmount = posSize / entryPrice;
 
@@ -677,9 +743,14 @@ export async function runEngineCycle(userId: number = DEFAULT_USER_ID): Promise<
 
         executed++;
 
+        // v3: Include risk context in notification
+        const riskInfo = riskAssessment
+          ? ` | Risk: ${riskAssessment.riskLevel} (${riskAssessment.positionSizeMultiplier.toFixed(2)}x) | Regime: ${riskAssessment.regime}`
+          : "";
+        const kellyInfo = kellyMult !== 1.0 ? ` | Kelly: ${kellyMult.toFixed(2)}x` : "";
         await notifyOwner({
           title: `📈 PAPER BUY — ${setup.pair.baseToken.symbol}`,
-          content: `Entry: $${entryPrice.toFixed(8)} | Size: $${posSize.toFixed(2)} | SL: $${stopLoss.toFixed(8)} | TP1: $${tp1.toFixed(8)} | Score: ${setup.score}/100 | Chain: ${setup.pair.chainId}\nReasons: ${setup.reasons.join(", ")}`,
+          content: `Entry: $${entryPrice.toFixed(8)} | Size: $${posSize.toFixed(2)} | SL: $${stopLoss.toFixed(8)} | TP1: $${tp1.toFixed(8)} | Score: ${setup.score}/100 | Chain: ${setup.pair.chainId}${riskInfo}${kellyInfo}\nReasons: ${setup.reasons.join(", ")}`,
         }).catch(() => {});
       } catch (err: any) {
         errors.push(`Execute ${setup.pair.baseToken.symbol}: ${err.message}`);
@@ -1087,7 +1158,7 @@ export function startEngine(userId: number = DEFAULT_USER_ID) {
 
   running = true;
   console.log(`[Engine] Starting for user ${userId}, interval: ${CONFIG.scanIntervalMs}ms`);
-  console.log(`[Engine] Features: rate-limiter, 4-tier profit-taking, adaptive trailing, social+whale scoring`);
+  console.log(`[Engine] Features: rate-limiter, 4-tier profit-taking, adaptive trailing, social+whale scoring, risk-manager v3`);
 
   // Register self-heal
   setSelfHealCallback(async () => {

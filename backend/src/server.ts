@@ -45,6 +45,12 @@ import {
   stopAutoTuneSchedule,
   getCurrentWeights,
 } from "./core/outcomeAutoTuner.js";
+import {
+  assessRisk,
+  calculateKelly,
+  detectMarketRegime,
+  getRiskConstants,
+} from "./core/riskManager.js";
 
 const app = express();
 app.use(cors());
@@ -282,11 +288,48 @@ app.get("/api/autotuner/weights", async (_req, res) => {
   }
 });
 
+// ─── RISK MANAGER ──────────────────────────────────────────
+
+app.get("/api/risk", async (_req, res) => {
+  try {
+    const assessment = await assessRisk(1);
+    res.json({
+      ...assessment,
+      chainExposure: Object.fromEntries(assessment.chainExposure),
+    });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get("/api/risk/kelly", async (_req, res) => {
+  try {
+    const kelly = await calculateKelly(1);
+    res.json(kelly);
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get("/api/risk/regime", async (_req, res) => {
+  try {
+    const regime = await detectMarketRegime();
+    res.json(regime);
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get("/api/risk/constants", (_req, res) => {
+  res.json(getRiskConstants());
+});
+
 // ─── STARTUP ────────────────────────────────────────────────
 
 async function main() {
   console.log("═══════════════════════════════════════════════");
-  console.log("  Memecoin Scanner — Standalone Engine v1.0");
+  console.log("  Memecoin Scanner — Standalone Engine v3.0");
+  console.log("  Risk Manager + Kelly + Regime Detection");
   console.log("═══════════════════════════════════════════════");
 
   // Initialize database
