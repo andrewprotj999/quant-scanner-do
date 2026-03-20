@@ -29,6 +29,11 @@ import {
   getDynamicParams,
 } from "./core/paperEngine.js";
 import {
+  getLastPipelineResult,
+  getPersistenceStats,
+  getActiveProfile,
+} from "./core/signalPipeline.js";
+import {
   getHealthStatus,
   getRecentCycles,
   getRecentErrors,
@@ -449,7 +454,42 @@ app.get("/api/signals", (_req, res) => {
   res.json(getAgentSignals());
 });
 
-// ─── v5: MASTER STATUS (all systems in one call) ─────────────────
+// ─── v6: SIGNAL PIPELINE STATUS ─────────────────────────────────
+
+app.get("/api/pipeline", (_req, res) => {
+  const result = getLastPipelineResult();
+  const persistence = getPersistenceStats();
+  const profile = getActiveProfile();
+  if (!result) {
+    res.json({ status: "no_data", message: "Pipeline has not run yet. Wait for first scan cycle.", profile, persistence });
+    return;
+  }
+  res.json({
+    version: "6.0",
+    profile,
+    stats: result.stats,
+    persistence,
+    topSignals: result.signals.slice(0, 10).map(s => ({
+      symbol: s.symbol,
+      chain: s.chain,
+      convictionTier: s.convictionTier,
+      convictionScore: s.convictionScore,
+      trustScore: s.trustScore,
+      momentumQuality: s.momentumQuality,
+      tradeabilityGrade: s.tradeabilityGrade,
+      entryGuidance: s.entryGuidance,
+      persistenceScans: s.persistenceScanCount,
+      riskLevel: s.riskLevel,
+      topFactors: s.topFactors,
+      weakFactors: s.weakFactors,
+      exitPlan: s.exitPlan,
+    })),
+    rejected: result.rejected.slice(0, 20),
+    timestamp: new Date().toISOString(),
+  });
+});
+
+// ─── v6: MASTER STATUS (all systems in one call) ─────────────────
 
 app.get("/api/dashboard", async (_req, res) => {
   try {
@@ -457,8 +497,9 @@ app.get("/api/dashboard", async (_req, res) => {
       queries.getOpenPositions(1),
       queries.getEngineState(1),
     ]);
+    const pipelineResult = getLastPipelineResult();
     res.json({
-      version: "5.0",
+      version: "6.0",
       engine: {
         running: isEngineRunning(),
         equity: engineState?.equity ?? "1000",
@@ -466,7 +507,18 @@ app.get("/api/dashboard", async (_req, res) => {
         totalScans: engineState?.totalScans ?? 0,
         totalTrades: engineState?.totalTrades ?? 0,
         openPositions: positions.length,
+        consecutiveLosses: engineState?.consecutiveLosses ?? 0,
       },
+      pipeline: pipelineResult ? {
+        profile: getActiveProfile(),
+        stats: pipelineResult.stats,
+        persistence: getPersistenceStats(),
+        topSignal: pipelineResult.signals[0] ? {
+          symbol: pipelineResult.signals[0].symbol,
+          tier: pipelineResult.signals[0].convictionTier,
+          score: pipelineResult.signals[0].convictionScore,
+        } : null,
+      } : null,
       risk: await assessRisk(1),
       agentSystem: getAgentSystemStatus(),
       specializedAgents: getSpecializedAgentStatus(),
@@ -483,8 +535,8 @@ app.get("/api/dashboard", async (_req, res) => {
 
 async function main() {
   console.log("═══════════════════════════════════════════════");
-  console.log("  Memecoin Scanner — Standalone Engine v5.0");
-  console.log("  Full Optimization Suite + Autonomous Agent System");
+  console.log("  Memecoin Scanner — Standalone Engine v6.0");
+  console.log("  14-Layer Signal Pipeline + Autonomous Agents");
   console.log("═══════════════════════════════════════════════");
 
   // Initialize database
@@ -526,11 +578,13 @@ async function main() {
   console.log("[Specialized] 5 specialized agents started (Sniper/Correlation/Regime/ExitIntel/ChainPerf)");
 
   console.log("\n═══════════════════════════════════════════════");
-  console.log("  ALL SYSTEMS ONLINE — 11 AGENTS ACTIVE");
-  console.log("  Core: Monitor | Optimizer | Healer | Learner");
+  console.log("  ALL SYSTEMS ONLINE — v6.0");
+  console.log("  Signal Pipeline: 14 layers active");
+  console.log("  Core Agents: Monitor | Optimizer | Healer | Learner");
   console.log("  Data: Freshness Agent");
   console.log("  Specialized: Sniper | Correlation | Regime");
   console.log("               Exit Intel | Chain Perf");
+  console.log("  Pipeline: /api/pipeline");
   console.log("  Dashboard: /api/dashboard");
   console.log("═══════════════════════════════════════════════");
 }
