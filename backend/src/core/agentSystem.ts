@@ -266,19 +266,14 @@ async function runOptimizerAgent(): Promise<void> {
       const lowWR = lowConviction.filter(p => parseFloat(p.pnlUsd ?? "0") > 0).length / lowConviction.length;
       const highWR = highConviction.filter(p => parseFloat(p.pnlUsd ?? "0") > 0).length / highConviction.length;
 
-      if (lowWR < 0.25 && highWR > lowWR + 0.1 && currentParams.minConviction < 80) {
+      // v6: conviction threshold is managed by signal pipeline
+      // Log the insight for learning but don't try to modify minConviction
+      if (lowWR < 0.25 && highWR > lowWR + 0.1) {
         paramChanges.push({
-          param: "minConviction",
-          oldValue: currentParams.minConviction,
-          newValue: Math.min(85, currentParams.minConviction + 5),
-          reason: `Low conviction WR ${(lowWR * 100).toFixed(0)}% vs high ${(highWR * 100).toFixed(0)}% — raising threshold`
-        });
-      } else if (lowWR > 0.4 && currentParams.minConviction > 65) {
-        paramChanges.push({
-          param: "minConviction",
-          oldValue: currentParams.minConviction,
-          newValue: Math.max(60, currentParams.minConviction - 5),
-          reason: `Low conviction trades winning at ${(lowWR * 100).toFixed(0)}% — can lower threshold for more opportunities`
+          param: "stopLossPercent",
+          oldValue: currentParams.stopLossPercent,
+          newValue: Math.max(5, currentParams.stopLossPercent - 0.5),
+          reason: `Low conviction WR ${(lowWR * 100).toFixed(0)}% vs high ${(highWR * 100).toFixed(0)}% — tightening SL to cut losers faster`
         });
       }
     }

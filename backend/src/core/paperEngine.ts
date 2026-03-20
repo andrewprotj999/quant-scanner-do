@@ -1,17 +1,21 @@
 /**
- * Paper Trading Engine — Standalone Version (v5)
+ * Paper Trading Engine — Standalone Version (v6)
  *
  * Autonomous scanner + executor running on an adaptive interval.
  * Each cycle:
  * 1. System health check + kill switch validation
- * 2. Equity curve MA analysis → trading mode (aggressive/normal/defensive/recovery)
+ * 2. Equity curve MA analysis → trading mode
  * 3. Time-of-day optimization → size multiplier + conviction adjustment
  * 4. Fetches trending/boosted tokens from DexScreener (all chains)
  * 5. Data feed validation → quality check before processing
- * 6. Qualifies each token against 11+ dimensions + holder analysis
+ * 6. ★ 14-LAYER SIGNAL PIPELINE (ported from Manus engine) ★
+ *    - Hard/soft filters, persistence, tradeability, momentum
+ *    - Multi-factor scoring, entry quality, scam defense
+ *    - 11-dimension conviction model, behavior protection
+ *    - Portfolio risk, exit planning, profiles
  * 7. Multi-source price validation before entry
  * 8. Volatility-adjusted + slippage-aware position sizing
- * 9. Execution abstraction layer (paper now, live-ready architecture)
+ * 9. Execution abstraction layer (paper now, live-ready)
  * 10. 4-tier profit-taking + adaptive trailing stop with MAE tracking
  * 11. Logs everything and sends Telegram notifications
  *
@@ -19,20 +23,10 @@
  *
  * v2: Rate limiter, 4-tier profit-taking, social+whale scoring
  * v3: Risk manager, Kelly criterion, BTC regime detection
- *
- * v4 additions:
- * - MAE (Maximum Adverse Excursion) analysis → data-driven stop-loss optimization
- * - Volatility-adjusted position sizing → smaller positions on volatile tokens
- * - Multi-source price validation → prevents stale/manipulated price entries
- * - Time-of-day optimization → learns best/worst trading hours from history
- * - Slippage estimation → AMM-aware sizing, prevents liquidity-crushing entries
- * - On-chain holder analysis → rug risk scoring from transaction patterns
- * - Equity curve MA → meta-strategy that reduces sizing during drawdowns
- * - Anti-fragility kill switch → auto-halts on systemic failures
- * - Data feed validation → detects stale/corrupted market data
- * - Adaptive scan frequency → faster in volatile markets, slower when quiet
- * - Execution abstraction layer → paper/live/shadow mode switching
- * - Position size validation → pre-execution checks for all orders
+ * v4: MAE, volatility sizing, price validation, time opt, slippage,
+ *     holder analysis, equity curve MA, system guards, execution layer
+ * v5: Specialized agents (sniper, correlation, momentum regime, exit intel, chain perf)
+ * v6: Complete 14-layer signal pipeline from Manus engine — replaces old qualifyToken
  */
 
 import { CONFIG } from "../config.js";
@@ -48,8 +42,6 @@ import {
   setSelfHealCallback,
 } from "./healthMonitor.js";
 import { dexFetch, dexFetchCached, getDexRateLimiterMetrics } from "./dexRateLimiter.js";
-import { extractSocialSignals, calculateSocialScore, getSocialRiskFlags } from "./socialSentiment.js";
-import { analyzeWhaleActivity, calculateWhaleScore, getWhaleRiskFlags } from "./whaleTracker.js";
 import {
   assessRisk,
   canEnterChain,
@@ -62,7 +54,6 @@ import { getVolatilityMultiplier } from "./volatilitySizer.js";
 import { fullPriceValidation } from "./priceValidator.js";
 import { getTimeOptimization } from "./timeOptimizer.js";
 import { estimateSlippage, adjustPositionForSlippage } from "./slippageEstimator.js";
-import { analyzeHolderPatterns, quickHolderCheck } from "./holderAnalysis.js";
 import { analyzeEquityCurve } from "./equityCurveMA.js";
 import {
   checkSystemHealth,
@@ -74,230 +65,203 @@ import {
 } from "./systemGuards.js";
 import { executeOrder, executePartialExit, type OrderResult } from "./executionLayer.js";
 import {
-  getRegimeSizingMultiplier,
-  getChainWeight,
-  isChainOverexposed,
-  getAgentSignals,
-} from "./specializedAgents.js";
+  runSignalPipeline,
+  selectForEntry,
+  calculatePositionSize as pipelineCalcSize,
+  setLastPipelineResult,
+  recordEntryOutcome,
+  setTokenCooldown,
+  type EnrichedSignal,
+  type PipelineResult,
+  type PortfolioContext,
+} from "./signalPipeline.js";
 
 // ─── DYNAMIC PARAMS (loaded from DB, refreshed each cycle) ──
 
 let dynamicParams = {
-  // v5 data-driven defaults (from 106-trade analysis)
-  minConviction: 80,       // was 70 — too many bad trades got through
-  trailPreTp1: 10,         // was 12 — tighter trail to lock gains
-  trailPostTp1: 7,         // was 8 — tighter after TP1
-  trailBigWin: 5,          // was 6 — protect big winners more
-  stopLossPercent: 7,      // was 10 — MAE data says 7% with HIGH confidence
-  tp1Percent: 18,          // was 25 — lower to capture more partial profits
-  breakEvenThreshold: 10,  // was 15 — move to breakeven sooner
-  minRiskPercent: 0.8,     // was 1.0 — smaller base risk
-  maxRiskPercent: 2.0,     // was 2.5 — reduce max risk
-  maxPosPctLow: 2.5,       // was 3 — smaller positions on low conviction
-  maxPosPctHigh: 5,        // was 7 — cap high conviction too
-  circuitBreakerPct: 35,   // was 50 — trigger earlier
+  // v6 defaults — signal pipeline handles conviction scoring
+  // These params now only affect position management (not entry qualification)
+  trailPreTp1: 10,
+  trailPostTp1: 7,
+  trailBigWin: 5,
+  stopLossPercent: 7,      // MAE-optimized default
+  tp1Percent: 18,
+  breakEvenThreshold: 10,
+  minRiskPercent: 0.8,
+  maxRiskPercent: 2.0,
+  maxPosPctLow: 2.5,
+  maxPosPctHigh: 5,
+  circuitBreakerPct: 35,
   rugLiqFdvMax: 5,
-  volDryUpThreshold: 0.03, // was 0.02 — slightly more sensitive
-  // 4-tier profit-taking params (optimized from trade data)
-  tpEarlyPercent: 8,       // was 12 — take early profits sooner
-  tpEarlySellRatio: 0.30,  // was 0.20 — sell more at early TP to lock gains
+  volDryUpThreshold: 0.03,
+  // 4-tier profit-taking params
+  tpEarlyPercent: 8,
+  tpEarlySellRatio: 0.30,
   tp1SellRatio: 0.25,
-  tp2Percent: 30,           // was 40 — more achievable TP2
+  tp2Percent: 30,
   tp2SellRatio: 0.25,
-  trailInitial: 8,          // was 10 — tighter initial trail
-  trailGainIncrement: 4,    // was 5 — trail tightens faster
-  trailMinPercent: 3,       // was 4 — tighter minimum trail
-  earlyProfitLockPercent: 1.5, // was 2 — lock profits earlier
+  trailInitial: 8,
+  trailGainIncrement: 4,
+  trailMinPercent: 3,
+  earlyProfitLockPercent: 1.5,
 };
+
+export function getDynamicParams() {
+  return { ...dynamicParams };
+}
 
 async function refreshDynamicParams(): Promise<void> {
   try {
     const dbParams = await queries.getEngineParams();
     if (dbParams) {
       dynamicParams = {
-        minConviction: dbParams.minConviction ?? 70,
-        trailPreTp1: parseFloat(String(dbParams.trailPreTp1 ?? "12")),
-        trailPostTp1: parseFloat(String(dbParams.trailPostTp1 ?? "8")),
-        trailBigWin: parseFloat(String(dbParams.trailBigWin ?? "6")),
-        stopLossPercent: parseFloat(String(dbParams.stopLossPercent ?? "10")),
-        tp1Percent: parseFloat(String(dbParams.tp1Percent ?? "25")),
-        breakEvenThreshold: parseFloat(String(dbParams.breakEvenThreshold ?? "15")),
-        minRiskPercent: parseFloat(String(dbParams.minRiskPercent ?? "1.0")),
-        maxRiskPercent: parseFloat(String(dbParams.maxRiskPercent ?? "2.5")),
-        maxPosPctLow: parseFloat(String(dbParams.maxPosPctLow ?? "3")),
-        maxPosPctHigh: parseFloat(String(dbParams.maxPosPctHigh ?? "7")),
-        circuitBreakerPct: parseFloat(String(dbParams.circuitBreakerPct ?? "50")),
+        trailPreTp1: parseFloat(String(dbParams.trailPreTp1 ?? "10")),
+        trailPostTp1: parseFloat(String(dbParams.trailPostTp1 ?? "7")),
+        trailBigWin: parseFloat(String(dbParams.trailBigWin ?? "5")),
+        stopLossPercent: parseFloat(String(dbParams.stopLossPercent ?? "7")),
+        tp1Percent: parseFloat(String(dbParams.tp1Percent ?? "18")),
+        breakEvenThreshold: parseFloat(String(dbParams.breakEvenThreshold ?? "10")),
+        minRiskPercent: parseFloat(String(dbParams.minRiskPercent ?? "0.8")),
+        maxRiskPercent: parseFloat(String(dbParams.maxRiskPercent ?? "2.0")),
+        maxPosPctLow: parseFloat(String(dbParams.maxPosPctLow ?? "2.5")),
+        maxPosPctHigh: parseFloat(String(dbParams.maxPosPctHigh ?? "5")),
+        circuitBreakerPct: parseFloat(String(dbParams.circuitBreakerPct ?? "35")),
         rugLiqFdvMax: parseFloat(String(dbParams.rugLiqFdvMax ?? "5")),
-        volDryUpThreshold: parseFloat(String(dbParams.volDryUpThreshold ?? "0.02")),
-        // 4-tier profit-taking
-        tpEarlyPercent: parseFloat(String((dbParams as any).tpEarlyPercent ?? "12")),
-        tpEarlySellRatio: parseFloat(String((dbParams as any).tpEarlySellRatio ?? "0.20")),
-        tp1SellRatio: parseFloat(String((dbParams as any).tp1SellRatio ?? "0.25")),
-        tp2Percent: parseFloat(String((dbParams as any).tp2Percent ?? "40")),
-        tp2SellRatio: parseFloat(String((dbParams as any).tp2SellRatio ?? "0.25")),
-        trailInitial: parseFloat(String((dbParams as any).trailInitial ?? "10")),
-        trailGainIncrement: parseFloat(String((dbParams as any).trailGainIncrement ?? "5")),
-        trailMinPercent: parseFloat(String((dbParams as any).trailMinPercent ?? "4")),
-        earlyProfitLockPercent: parseFloat(String((dbParams as any).earlyProfitLockPercent ?? "2")),
+        volDryUpThreshold: parseFloat(String(dbParams.volDryUpThreshold ?? "0.03")),
+        tpEarlyPercent: parseFloat(String(dbParams.tpEarlyPercent ?? "8")),
+        tpEarlySellRatio: parseFloat(String(dbParams.tpEarlySellRatio ?? "0.30")),
+        tp1SellRatio: parseFloat(String(dbParams.tp1SellRatio ?? "0.25")),
+        tp2Percent: parseFloat(String(dbParams.tp2Percent ?? "30")),
+        tp2SellRatio: parseFloat(String(dbParams.tp2SellRatio ?? "0.25")),
+        trailInitial: parseFloat(String(dbParams.trailInitial ?? "8")),
+        trailGainIncrement: parseFloat(String(dbParams.trailGainIncrement ?? "4")),
+        trailMinPercent: parseFloat(String(dbParams.trailMinPercent ?? "3")),
+        earlyProfitLockPercent: parseFloat(String(dbParams.earlyProfitLockPercent ?? "1.5")),
       };
-      console.log(`[Engine] Loaded dynamic params v${dbParams.version ?? 1}`);
     }
-  } catch {
-    // Silently use defaults
-  }
+  } catch { /* use defaults */ }
 }
 
-export function getDynamicParams() {
-  return { ...dynamicParams };
-}
-
-// ─── TYPES ──────────────────────────────────────────────────
-
-interface DexPair {
-  chainId: string;
-  dexId: string;
-  pairAddress: string;
-  baseToken: { address: string; name: string; symbol: string };
-  quoteToken: { symbol: string };
-  priceUsd: string;
-  priceChange?: { h1?: number; h6?: number; h24?: number; m5?: number };
-  liquidity?: { usd?: number };
-  volume?: { h24?: number; h1?: number; h6?: number; m5?: number };
-  txns?: {
-    h1?: { buys?: number; sells?: number };
-    m5?: { buys?: number; sells?: number };
-    h6?: { buys?: number; sells?: number };
-  };
-  fdv?: number;
-  pairCreatedAt?: number;
-  info?: { socials?: any[]; imageUrl?: string };
-  boosted?: boolean;
-}
-
-interface QualificationResult {
-  qualified: boolean;
-  score: number;
-  reasons: string[];
-  failures: string[];
-  pair: DexPair;
-}
-
-// ─── DEXSCREENER API (rate-limited + cached) ────────────────
+// ─── DEX API ────────────────────────────────────────────────
 
 const DEX_API = "https://api.dexscreener.com";
 
-// Shared pair data map — populated by scan, reused by position monitor
-let lastScanPairMap = new Map<string, DexPair>(); // key: pairAddress
+// Cache scan data so position monitor can reuse without extra API calls
+const lastScanPairMap = new Map<string, DexPair>();
 
-export function getScanPairMap(): Map<string, DexPair> {
-  return lastScanPairMap;
+interface DexPair {
+  pairAddress: string;
+  chainId: string;
+  dexId: string;
+  baseToken: { address: string; symbol: string; name: string };
+  quoteToken: { address: string; symbol: string; name: string };
+  priceUsd: string;
+  priceNative: string;
+  volume: { m5: number; h1: number; h6: number; h24: number };
+  priceChange: { m5: number; h1: number; h6: number; h24: number };
+  liquidity: { usd: number; base: number; quote: number };
+  fdv: number;
+  marketCap: number;
+  txns: {
+    m5: { buys: number; sells: number };
+    h1: { buys: number; sells: number };
+    h6: { buys: number; sells: number };
+    h24: { buys: number; sells: number };
+  };
+  pairCreatedAt?: number;
+  url?: string;
+  info?: {
+    imageUrl?: string;
+    websites?: Array<{ url: string }>;
+    socials?: Array<{ type: string; url: string }>;
+  };
 }
 
 async function fetchAllTokenSources(): Promise<DexPair[]> {
+  const allPairs: DexPair[] = [];
   const seen = new Set<string>();
-  const allTokenRefs: { chainId: string; tokenAddress: string; source: string }[] = [];
 
-  function addTokens(tokens: any[], source: string, maxPerSource = 50) {
-    let added = 0;
-    for (const t of tokens) {
-      if (added >= maxPerSource) break;
-      const chain = t.chainId;
-      const addr = t.tokenAddress;
+  const endpoints = [
+    `${DEX_API}/token-boosts/latest/v1`,
+    `${DEX_API}/token-profiles/latest/v1`,
+  ];
+
+  for (const url of endpoints) {
+    try {
+      const data = await dexFetchCached(url, 25_000, "normal");
+      const items = Array.isArray(data) ? data : [];
+
+      for (const item of items) {
+        const chain = item.chainId;
+        const addr = item.tokenAddress;
+        if (!chain || !addr) continue;
+        const key = `${chain}:${addr}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+
+        try {
+          const pairData = await dexFetchCached(
+            `${DEX_API}/latest/dex/tokens/${addr}`,
+            30_000,
+            "normal"
+          );
+          const pairs = pairData?.pairs || [];
+          if (pairs.length > 0) {
+            const best = pairs.sort(
+              (a: any, b: any) => (b.liquidity?.usd ?? 0) - (a.liquidity?.usd ?? 0)
+            )[0];
+            if (!seen.has(best.pairAddress)) {
+              seen.add(best.pairAddress);
+              allPairs.push(best);
+              lastScanPairMap.set(best.pairAddress, best);
+            }
+          }
+        } catch { /* skip */ }
+      }
+    } catch { /* skip source */ }
+  }
+
+  // Also fetch trending
+  try {
+    const trending = await dexFetchCached(
+      `${DEX_API}/token-boosts/top/v1`,
+      30_000,
+      "normal"
+    );
+    const items = Array.isArray(trending) ? trending : [];
+    for (const item of items.slice(0, 20)) {
+      const chain = item.chainId;
+      const addr = item.tokenAddress;
       if (!chain || !addr) continue;
       const key = `${chain}:${addr}`;
-      if (!seen.has(key)) {
-        seen.add(key);
-        allTokenRefs.push({ chainId: chain, tokenAddress: addr, source });
-        added++;
-      }
+      if (seen.has(key)) continue;
+      seen.add(key);
+
+      try {
+        const pairData = await dexFetchCached(
+          `${DEX_API}/latest/dex/tokens/${addr}`,
+          30_000,
+          "normal"
+        );
+        const pairs = pairData?.pairs || [];
+        if (pairs.length > 0) {
+          const best = pairs.sort(
+            (a: any, b: any) => (b.liquidity?.usd ?? 0) - (a.liquidity?.usd ?? 0)
+          )[0];
+          if (!seen.has(best.pairAddress)) {
+            seen.add(best.pairAddress);
+            allPairs.push(best);
+            lastScanPairMap.set(best.pairAddress, best);
+          }
+        }
+      } catch { /* skip */ }
     }
-  }
+  } catch { /* skip */ }
 
-  // ── Source 1-4: Fetch all sources via rate-limited cached API ──
-  const [topBoosts, latestBoosts, latestProfiles, trendingResults] =
-    await Promise.allSettled([
-      dexFetchCached(`${DEX_API}/token-boosts/top/v1`, 30_000, "normal")
-        .then((d: any) => (Array.isArray(d) ? d : []))
-        .catch(() => []),
-      dexFetchCached(`${DEX_API}/token-boosts/latest/v1`, 30_000, "normal")
-        .then((d: any) => (Array.isArray(d) ? d : []))
-        .catch(() => []),
-      dexFetchCached(`${DEX_API}/token-profiles/latest/v1`, 30_000, "normal")
-        .then((d: any) => (Array.isArray(d) ? d : []))
-        .catch(() => []),
-      // Trending search (90s cache — barely changes)
-      Promise.allSettled(
-        ["meme", "AI", "gaming", "DeFi", "RWA"].map((q) =>
-          dexFetchCached(`${DEX_API}/latest/dex/search?q=${q}`, 90_000, "low")
-            .then((d: any) =>
-              (d?.pairs || []).map((p: any) => ({
-                chainId: p.chainId,
-                tokenAddress: p.baseToken?.address,
-              }))
-            )
-            .catch(() => [])
-        )
-      ).then((results) =>
-        results.flatMap((r) => (r.status === "fulfilled" ? r.value : []))
-      ),
-    ]);
-
-  if (topBoosts.status === "fulfilled") {
-    addTokens(Array.isArray(topBoosts.value) ? topBoosts.value : [], "top_boost", 50);
-  }
-  if (latestBoosts.status === "fulfilled") {
-    addTokens(Array.isArray(latestBoosts.value) ? latestBoosts.value : [], "latest_boost", 50);
-  }
-  if (latestProfiles.status === "fulfilled") {
-    addTokens(Array.isArray(latestProfiles.value) ? latestProfiles.value : [], "profile", 40);
-  }
-  if (trendingResults.status === "fulfilled") {
-    addTokens(Array.isArray(trendingResults.value) ? trendingResults.value : [], "trending", 60);
-  }
-
-  console.log(`[Engine] Discovered ${allTokenRefs.length} unique tokens across 4 sources`);
-
-  // Batch fetch pair data by chain (rate-limited)
-  const byChain = new Map<string, string[]>();
-  for (const t of allTokenRefs) {
-    const arr = byChain.get(t.chainId) || [];
-    arr.push(t.tokenAddress);
-    byChain.set(t.chainId, arr);
-  }
-
-  const pairFetches: Promise<DexPair[]>[] = [];
-  for (const [chainId, addresses] of Array.from(byChain.entries())) {
-    for (let i = 0; i < addresses.length; i += 30) {
-      const batch = addresses.slice(i, i + 30).join(",");
-      pairFetches.push(
-        dexFetchCached(`${DEX_API}/tokens/v1/${chainId}/${batch}`, 30_000, "normal")
-          .then((d: any) => (Array.isArray(d) ? d : []))
-          .catch(() => [] as DexPair[])
-      );
-    }
-  }
-
-  const pairResults = await Promise.allSettled(pairFetches);
-  const allPairs: DexPair[] = [];
-  for (const result of pairResults) {
-    if (result.status === "fulfilled") allPairs.push(...result.value);
-  }
-
-  // Deduplicate and build pair map
-  const seenPairs = new Set<string>();
-  const uniquePairs: DexPair[] = [];
-  lastScanPairMap = new Map();
-  for (const pair of allPairs) {
-    if (pair.pairAddress && !seenPairs.has(pair.pairAddress)) {
-      seenPairs.add(pair.pairAddress);
-      uniquePairs.push(pair);
-      lastScanPairMap.set(pair.pairAddress, pair);
-    }
-  }
-
-  console.log(`[Engine] Fetched ${uniquePairs.length} unique pairs`);
-  return uniquePairs;
+  return allPairs;
 }
+
+// ─── PRICE FETCHER (for position monitoring) ────────────────
 
 export async function fetchPairPrice(pairAddress: string, chainId?: string): Promise<DexPair | null> {
   // First check scan data cache (avoids extra API call)
@@ -308,8 +272,8 @@ export async function fetchPairPrice(pairAddress: string, chainId?: string): Pro
     if (chainId) {
       const data = await dexFetchCached(
         `${DEX_API}/latest/dex/pairs/${chainId}/${pairAddress}`,
-        15_000, // 15s cache for position monitoring
-        "high" // Position monitoring is high priority
+        15_000,
+        "high"
       );
       const pairs = data?.pairs || (Array.isArray(data) ? data : []);
       if (pairs.length > 0) return pairs[0];
@@ -330,310 +294,6 @@ export async function fetchPairPrice(pairAddress: string, chainId?: string): Pro
   } catch {
     return null;
   }
-}
-
-// ─── TOKEN QUALIFICATION (ALL 9+ RULES + SOCIAL + WHALE) ────
-
-export function qualifyToken(pair: DexPair, learnedAdjustments?: Map<string, number>): QualificationResult {
-  const reasons: string[] = [];
-  const failures: string[] = [];
-  let score = 50;
-
-  const price = parseFloat(pair.priceUsd || "0");
-  const liq = pair.liquidity?.usd ?? 0;
-  const vol24h = pair.volume?.h24 ?? 0;
-  const volH1 = pair.volume?.h1 ?? 0;
-  const volM5 = pair.volume?.m5 ?? 0;
-  const priceChangeH1 = pair.priceChange?.h1 ?? 0;
-  const priceChangeH6 = pair.priceChange?.h6 ?? 0;
-  const priceChangeM5 = pair.priceChange?.m5 ?? 0;
-  const buysM5 = pair.txns?.m5?.buys ?? 0;
-  const sellsM5 = pair.txns?.m5?.sells ?? 0;
-  const buysH1 = pair.txns?.h1?.buys ?? 0;
-  const sellsH1 = pair.txns?.h1?.sells ?? 0;
-  const pairAge = pair.pairCreatedAt ? Date.now() - pair.pairCreatedAt : Infinity;
-  const pairAgeMinutes = pairAge / 60000;
-  const fdv = pair.fdv ?? 0;
-
-  // v5: Chain-specific adjustments (from 106-trade analysis)
-  // BSC: -$173 PnL, 31% WR — penalize heavily
-  // Solana: best performer — slight bonus
-  const chain = pair.chainId;
-  if (chain === "bsc") {
-    score -= 15;
-    reasons.push("Chain penalty: BSC historically underperforms (-15)");
-  } else if (chain === "solana") {
-    score += 5;
-    reasons.push("Chain bonus: Solana historically outperforms (+5)");
-  } else if (chain === "base") {
-    score += 2;
-    reasons.push("Chain: Base neutral-positive (+2)");
-  }
-
-  // v5: Minimum liquidity raised for BSC (higher rug risk)
-  if (chain === "bsc" && liq < 200_000) {
-    failures.push(`BSC requires $200K+ liquidity (has $${liq.toLocaleString()})`);
-    return { qualified: false, score: 0, reasons, failures, pair };
-  }
-
-  // Rug-pull detection
-  if (fdv > 0 && liq > fdv * dynamicParams.rugLiqFdvMax) {
-    failures.push(`Suspicious: liquidity > ${dynamicParams.rugLiqFdvMax}x FDV — likely fake`);
-    return { qualified: false, score: 0, reasons, failures, pair };
-  }
-  if (liq > 10_000_000 && fdv > 0 && fdv < 5_000_000) {
-    failures.push(`Suspicious: high liq but low FDV — rug signal`);
-    return { qualified: false, score: 0, reasons, failures, pair };
-  }
-  if (liq > 20_000_000 && pairAgeMinutes < 1440) {
-    failures.push(`Suspicious: >$20M liq on pair < 24h old`);
-    return { qualified: false, score: 0, reasons, failures, pair };
-  }
-
-  // Liquidity filter
-  if (liq < 100_000) {
-    failures.push(`Liquidity too low: $${liq.toLocaleString()}`);
-    return { qualified: false, score: 0, reasons, failures, pair };
-  }
-  score += 10;
-  reasons.push(`Liquidity: $${liq.toLocaleString()}`);
-
-  // Sweet spot bonus
-  if (liq >= 100_000 && liq <= 2_000_000) {
-    score += 5;
-    reasons.push(`Liquidity in sweet spot ($100K-$2M)`);
-  }
-
-  // Volume filter
-  if (volM5 <= 0 && volH1 <= 0) {
-    failures.push("No recent volume");
-    return { qualified: false, score: 0, reasons, failures, pair };
-  }
-  if (volH1 > 10_000) {
-    score += 5;
-    reasons.push(`Strong H1 volume: $${volH1.toLocaleString()}`);
-  }
-
-  // Volume/liquidity health
-  if (liq > 0 && vol24h > 0) {
-    const volLiqRatio = vol24h / liq;
-    if (volLiqRatio > 5) {
-      score -= 10;
-      reasons.push(`High vol/liq ratio ${volLiqRatio.toFixed(1)}x — wash trading risk`);
-    } else if (volLiqRatio >= 0.5 && volLiqRatio <= 3) {
-      score += 5;
-      reasons.push(`Healthy vol/liq ratio: ${volLiqRatio.toFixed(1)}x`);
-    }
-  }
-
-  // Honeypot check
-  const totalTxnsM5 = buysM5 + sellsM5;
-  if (totalTxnsM5 > 10 && sellsM5 / totalTxnsM5 < 0.1) {
-    failures.push(`Possible honeypot: ${sellsM5} sells vs ${buysM5} buys`);
-    return { qualified: false, score: 0, reasons, failures, pair };
-  }
-
-  // Entry strategy — pullback, not pump
-  if (priceChangeM5 > 5) {
-    failures.push(`Pumping +${priceChangeM5.toFixed(1)}% in 5m — no chase`);
-    return { qualified: false, score: 0, reasons, failures, pair };
-  }
-
-  if (priceChangeH1 <= -5 && priceChangeH1 >= -20) {
-    score += 15;
-    reasons.push(`Good pullback: ${priceChangeH1.toFixed(1)}% H1`);
-  } else if (priceChangeH1 < -20) {
-    failures.push(`Crash too deep: ${priceChangeH1.toFixed(1)}% H1`);
-    return { qualified: false, score: 0, reasons, failures, pair };
-  } else if (priceChangeH1 > 0 && priceChangeH1 < 5) {
-    score += 5;
-    reasons.push(`Consolidating: ${priceChangeH1.toFixed(1)}% H1`);
-  } else if (priceChangeH1 >= 5) {
-    score -= 5;
-    reasons.push(`Running up ${priceChangeH1.toFixed(1)}% H1`);
-  }
-
-  // Multi-timeframe confirmation
-  if (priceChangeH6 > 10 && priceChangeH1 <= -5) {
-    score += 10;
-    reasons.push(`H6 uptrend with H1 pullback — strong setup`);
-  } else if (priceChangeH6 < -30) {
-    score -= 10;
-    reasons.push(`H6 downtrend — falling knife risk`);
-  }
-
-  // Pair age
-  if (pairAgeMinutes < 3) {
-    failures.push(`Too new: ${pairAgeMinutes.toFixed(0)}m old`);
-    return { qualified: false, score: 0, reasons, failures, pair };
-  }
-  if (pairAgeMinutes > 10) {
-    score += 5;
-    reasons.push(`Pair age: ${Math.floor(pairAgeMinutes)}m`);
-  }
-
-  // FDV check
-  if (fdv > 0 && fdv < 10_000) {
-    failures.push(`FDV too low: $${fdv.toLocaleString()}`);
-    return { qualified: false, score: 0, reasons, failures, pair };
-  }
-
-  // Volume momentum
-  if (volM5 > 5000) {
-    score += 5;
-    reasons.push(`Strong M5 volume: $${volM5.toLocaleString()}`);
-  }
-
-  // Buy/sell ratio
-  if (totalTxnsM5 > 5) {
-    const buyRatio = buysM5 / totalTxnsM5;
-    if (buyRatio > 0.4 && buyRatio < 0.7) {
-      score += 5;
-      reasons.push(`Healthy buy/sell ratio: ${(buyRatio * 100).toFixed(0)}%`);
-    }
-  }
-
-  // H1 activity
-  const totalTxnsH1 = buysH1 + sellsH1;
-  if (totalTxnsH1 > 50) {
-    score += 5;
-    reasons.push(`Active trading: ${totalTxnsH1} txns H1`);
-  }
-
-  // ── DIMENSION 10: Social Sentiment ──
-  const socialSignals = extractSocialSignals(pair);
-  const { score: socialScore, factors: socialFactors } = calculateSocialScore(socialSignals);
-  const socialRiskFlags = getSocialRiskFlags(socialSignals);
-
-  // Normalize social score (0-100) to conviction adjustment (-5 to +10)
-  const socialAdj = Math.round((socialScore / 100) * 15) - 5;
-  score += socialAdj;
-  if (socialAdj !== 0) {
-    reasons.push(`Social: ${socialAdj > 0 ? "+" : ""}${socialAdj} (${socialFactors.slice(0, 2).join(", ")})`);
-  }
-  if (socialRiskFlags.includes("NO_SOCIALS")) {
-    score -= 5;
-    reasons.push("Social risk: no social links");
-  }
-
-  // ── DIMENSION 11: Whale Activity ──
-  const whaleSignals = analyzeWhaleActivity(pair);
-  const { score: whaleScore, factors: whaleFactors } = calculateWhaleScore(whaleSignals);
-  const whaleRiskFlags = getWhaleRiskFlags(whaleSignals, pair);
-
-  // Normalize whale score (0-100) to conviction adjustment (-5 to +10)
-  const whaleAdj = Math.round((whaleScore / 100) * 15) - 5;
-  score += whaleAdj;
-  if (whaleAdj !== 0) {
-    reasons.push(`Whale: ${whaleAdj > 0 ? "+" : ""}${whaleAdj} (${whaleFactors.slice(0, 2).join(", ")})`);
-  }
-  if (whaleRiskFlags.includes("DUMP_PATTERN")) {
-    score -= 10;
-    reasons.push("Whale risk: dump pattern detected");
-  }
-  if (whaleRiskFlags.includes("HEAVY_SELLING")) {
-    score -= 5;
-    reasons.push("Whale risk: heavy selling pressure");
-  }
-
-  // Learning adjustments
-  if (learnedAdjustments && learnedAdjustments.size > 0) {
-    const chainAdj = learnedAdjustments.get(`chain:${pair.chainId}`);
-    if (chainAdj) { score += chainAdj; reasons.push(`Learning: chain adj ${chainAdj > 0 ? "+" : ""}${chainAdj}`); }
-
-    const dexAdj = learnedAdjustments.get(`dex:${pair.dexId}`);
-    if (dexAdj) { score += dexAdj; reasons.push(`Learning: dex adj ${dexAdj > 0 ? "+" : ""}${dexAdj}`); }
-
-    let liqKey = "<100K";
-    if (liq >= 100000 && liq < 500000) liqKey = "100K-500K";
-    else if (liq >= 500000 && liq < 1000000) liqKey = "500K-1M";
-    else if (liq >= 1000000) liqKey = ">1M";
-    const liqAdj = learnedAdjustments.get(`liquidity_range:${liqKey}`);
-    if (liqAdj) { score += liqAdj; reasons.push(`Learning: liq adj ${liqAdj > 0 ? "+" : ""}${liqAdj}`); }
-
-    const hour = new Date().getUTCHours();
-    let timeKey = "night";
-    if (hour >= 6 && hour < 12) timeKey = "morning";
-    else if (hour >= 12 && hour < 18) timeKey = "afternoon";
-    else if (hour >= 18 && hour < 24) timeKey = "evening";
-    const timeAdj = learnedAdjustments.get(`time_of_day:${timeKey}`);
-    if (timeAdj) { score += timeAdj; reasons.push(`Learning: time adj ${timeAdj > 0 ? "+" : ""}${timeAdj}`); }
-  }
-
-  // ── v5: Specialized Agent Signals ──
-  // Chain weight from chain performance agent
-  const chainWeight = getChainWeight(pair.chainId);
-  if (chainWeight < 0.15) {
-    score -= 10;
-    reasons.push(`Chain perf agent: low weight ${(chainWeight * 100).toFixed(0)}% (-10)`);
-  } else if (chainWeight > 0.35) {
-    score += 5;
-    reasons.push(`Chain perf agent: high weight ${(chainWeight * 100).toFixed(0)}% (+5)`);
-  }
-
-  // Correlation/concentration check
-  if (isChainOverexposed(pair.chainId)) {
-    score -= 15;
-    reasons.push(`Correlation agent: chain ${pair.chainId} overexposed (-15)`);
-  }
-
-  // Regime-based adjustment
-  const agentSignals = getAgentSignals();
-  if (agentSignals.regime === "choppy") {
-    score -= 10;
-    reasons.push("Regime agent: choppy market (-10)");
-  } else if (agentSignals.regime === "trending_down") {
-    score -= 8;
-    reasons.push("Regime agent: downtrend (-8)");
-  } else if (agentSignals.regime === "trending_up") {
-    score += 3;
-    reasons.push("Regime agent: uptrend (+3)");
-  }
-
-  score = Math.min(100, Math.max(0, score));
-
-  if (score < dynamicParams.minConviction) {
-    failures.push(`Conviction too low: ${score}/100 (min ${dynamicParams.minConviction})`);
-    return { qualified: false, score, reasons, failures, pair };
-  }
-
-  return { qualified: true, score, reasons, failures, pair };
-}
-
-// ─── POSITION SIZING ────────────────────────────────────────
-
-function calculatePositionSize(
-  balance: number,
-  entryPrice: number,
-  stopLossPrice: number,
-  convictionScore: number = 70
-): number {
-  const minConv = dynamicParams.minConviction;
-  const normalizedConviction = Math.max(0, Math.min(100 - minConv, convictionScore - minConv)) / (100 - minConv);
-  const dynamicRisk = dynamicParams.minRiskPercent + normalizedConviction * (dynamicParams.maxRiskPercent - dynamicParams.minRiskPercent);
-  const riskAmount = balance * (dynamicRisk / 100);
-  const stopDistance = Math.abs(entryPrice - stopLossPrice) / entryPrice;
-  if (stopDistance === 0) return riskAmount;
-  let posSize = riskAmount / stopDistance;
-  const maxPct = (dynamicParams.maxPosPctLow / 100) + normalizedConviction * ((dynamicParams.maxPosPctHigh - dynamicParams.maxPosPctLow) / 100);
-  posSize = Math.min(posSize, balance * maxPct);
-
-  // v5: Apply regime sizing multiplier from momentum regime agent
-  const regimeMultiplier = getRegimeSizingMultiplier();
-  posSize *= regimeMultiplier;
-
-  // v5: Apply chain weight — reduce size on underperforming chains
-  // chainWeight ranges 0-1, we map to 0.5-1.2 multiplier
-  // This means worst chains get 50% sizing, best get 120%
-  // (placeholder chain gets neutral 1.0)
-  // Only apply if we have enough data (agent has run)
-  const agentSigs = getAgentSignals();
-  if (Object.keys(agentSigs.chainAllocations).length > 0) {
-    // We don't have the chain here directly, but the engine passes it through
-    // This is applied at the engine cycle level instead
-  }
-
-  return posSize;
 }
 
 // ─── MAIN ENGINE CYCLE ──────────────────────────────────────
@@ -661,20 +321,17 @@ export async function runEngineCycle(userId: number = DEFAULT_USER_ID): Promise<
   try {
     await refreshDynamicParams();
 
-    // ── v4: System health check + kill switch ──
+    // ── System health check + kill switch ──
     const sysHealth = checkSystemHealth();
     if (!sysHealth.tradingAllowed) {
       console.log(`[SystemGuard] Trading BLOCKED — Health: ${sysHealth.healthScore}/100 | Issues: ${sysHealth.issues.join(", ")}`);
       return { scanned: 0, qualified: 0, executed: 0, positionsUpdated: 0, errors: [`System health too low: ${sysHealth.healthScore}/100`] };
     }
-    if (sysHealth.healthScore < 70) {
-      console.log(`[SystemGuard] Degraded health: ${sysHealth.healthScore}/100 | ${sysHealth.issues.join(", ")}`);
-    }
 
-    // ── v3: Daily P&L reset check ──
+    // ── Daily P&L reset check ──
     await checkDailyReset(userId).catch(() => {});
 
-    // ── v4: Equity curve MA analysis ──
+    // ── Equity curve MA analysis ──
     let equityCurveMultiplier = 1.0;
     let equityCurveMode = "normal";
     try {
@@ -682,35 +339,27 @@ export async function runEngineCycle(userId: number = DEFAULT_USER_ID): Promise<
       equityCurveMultiplier = ecState.sizeMultiplier;
       equityCurveMode = ecState.mode;
       if (ecState.mode !== "normal") {
-        console.log(`[EquityCurve] Mode: ${ecState.mode} | EMA dist: ${ecState.distanceFromEMA.toFixed(1)}% | Mult: ${ecState.sizeMultiplier.toFixed(2)}x | Trend: ${ecState.trend}`);
+        console.log(`[EquityCurve] Mode: ${ecState.mode} | Mult: ${ecState.sizeMultiplier.toFixed(2)}x`);
       }
     } catch { /* non-critical */ }
 
-    // ── v4: Time-of-day optimization ──
+    // ── Time-of-day optimization ──
     let timeMultiplier = 1.0;
     let timeConvictionAdj = 0;
     try {
       const timeOpt = await getTimeOptimization(userId);
       timeMultiplier = timeOpt.sizeMultiplier;
       timeConvictionAdj = timeOpt.convictionAdjustment;
-      if (timeOpt.hasData && (timeMultiplier !== 1.0 || timeConvictionAdj !== 0)) {
-        console.log(`[TimeOpt] Hour ${timeOpt.currentHourUTC} UTC | Size: ${timeMultiplier.toFixed(2)}x | Conv adj: ${timeConvictionAdj > 0 ? "+" : ""}${timeConvictionAdj}`);
-      }
     } catch { /* non-critical */ }
 
-    // ── v3: Comprehensive risk assessment ──
+    // ── Risk assessment ──
     let riskAssessment: RiskAssessment | null = null;
     try {
       riskAssessment = await assessRisk(userId);
-      if (riskAssessment.reasons.length > 0) {
-        console.log(`[RiskManager] ${riskAssessment.riskLevel.toUpperCase()} | Multiplier: ${riskAssessment.positionSizeMultiplier.toFixed(2)}x | ${riskAssessment.reasons.join(" | ")}`);
-      }
       if (riskAssessment.riskLevel === "halted") {
-        console.log(`[RiskManager] HALTED — no new positions. Reasons: ${riskAssessment.reasons.join(", ")}`);
+        console.log(`[RiskManager] HALTED — ${riskAssessment.reasons.join(", ")}`);
       }
-    } catch (err: any) {
-      console.error(`[RiskManager] Assessment failed (using defaults): ${err.message}`);
-    }
+    } catch { /* use defaults */ }
 
     // Get or init engine state
     let state = await withDbRetry(() => queries.getEngineState(userId), "getEngineState");
@@ -750,7 +399,7 @@ export async function runEngineCycle(userId: number = DEFAULT_USER_ID): Promise<
       }
     }
 
-    // Check max positions + v3 risk-based limits
+    // Check max positions + risk-based limits
     const currentOpenCount = (await withDbRetry(() => queries.getOpenPositions(userId), "getOpenCount")).length;
     const maxPositions = riskAssessment
       ? Math.min(CONFIG.maxPositions, riskAssessment.maxNewPositions + currentOpenCount)
@@ -769,17 +418,13 @@ export async function runEngineCycle(userId: number = DEFAULT_USER_ID): Promise<
     const pairs = await fetchAllTokenSources();
     scanned = pairs.length;
 
-    // v4: Data feed validation
+    // Data feed validation
     if (pairs.length > 0) {
       const feedCheck = validateDataFeed(pairs);
       if (!feedCheck.healthy) {
         console.log(`[DataFeed] UNHEALTHY (${feedCheck.qualityScore}/100): ${feedCheck.issues.join(", ")}`);
         recordFailure();
       } else {
-        const volatility = detectVolatilityLevel(pairs);
-        if (volatility !== "normal") {
-          console.log(`[DataFeed] Volatility: ${volatility} | Quality: ${feedCheck.qualityScore}/100`);
-        }
         recordSuccess(pairs.length, Date.now() - cycleStart);
       }
     } else {
@@ -798,130 +443,150 @@ export async function runEngineCycle(userId: number = DEFAULT_USER_ID): Promise<
     } catch { /* non-critical */ }
 
     const openSymbols = openPositions.map((p) => p.tokenSymbol.toUpperCase());
-    const qualifiedSetups: QualificationResult[] = [];
 
-    for (const pair of pairs) {
-      const symbol = pair.baseToken?.symbol?.toUpperCase();
-      if (!symbol || openSymbols.includes(symbol)) continue;
+    // ★★★ v6: RUN THE 14-LAYER SIGNAL PIPELINE ★★★
+    // This replaces the old qualifyToken() with the full Manus intelligence stack
+    const portfolioContext: PortfolioContext = {
+      openPositionCount: currentOpenCount,
+      maxPositions,
+      openChains: openPositions.map(p => p.chain),
+      maxSameChain: 5,
+      dailyPnlPercent: parseFloat(state.dailyPnlUsd ?? "0") / balance * 100,
+      totalEquity: balance,
+      consecutiveLosses: state.consecutiveLosses ?? 0,
+    };
 
-      const result = qualifyToken(pair, learnedAdjustments);
-      if (!result.qualified) continue;
+    const pipelineResult = runSignalPipeline(
+      pairs,
+      learnedAdjustments,
+      openSymbols,
+      [], // avoidTokens — handled by pipeline cooldown system
+      portfolioContext
+    );
 
-      // v4: Apply time-of-day conviction adjustment
-      if (timeConvictionAdj !== 0) {
-        result.score = Math.min(100, Math.max(0, result.score + timeConvictionAdj));
-        if (result.score < dynamicParams.minConviction) continue; // Dropped below threshold
-      }
+    // Store pipeline result for API access
+    setLastPipelineResult(pipelineResult);
 
-      // v4: Holder analysis — reject critical risk tokens
-      try {
-        const holderCheck = quickHolderCheck(pair);
-        if (!holderCheck.proceed) {
-          continue; // Critical holder risk — skip
-        }
-        if (holderCheck.risk === "high") {
-          result.score = Math.max(0, result.score - 5); // Penalize high risk
-          result.reasons.push(`Holder risk: ${holderCheck.risk}`);
-        }
-      } catch { /* non-critical */ }
+    qualified = pipelineResult.stats.entryAllowed;
 
-      qualifiedSetups.push(result);
-      qualified++;
-    }
+    // Log pipeline stats
+    const ps = pipelineResult.stats;
+    console.log(`[Pipeline] Scanned: ${ps.totalScanned} | Hard-filtered: ${ps.hardFiltered} | Scored: ${ps.scored} | Entry-allowed: ${ps.entryAllowed} | Scam-blocked: ${ps.scamBlocked}`);
+    console.log(`[Pipeline] Tiers: A+=${ps.tierAPlus} A=${ps.tierA} B=${ps.tierB} C=${ps.tierC} D=${ps.tierD} | Avg conviction: ${ps.avgConvictionScore} | Avg trust: ${ps.avgTrustScore}`);
 
-    // Execute top setups (v3: risk-adjusted)
+    // Select best entries using the pipeline's selectForEntry
     const slotsAvailable = riskAssessment
       ? Math.min(maxPositions - currentOpenCount, riskAssessment.maxNewPositions)
       : maxPositions - currentOpenCount;
-    const toExecute = qualifiedSetups.sort((a, b) => b.score - a.score).slice(0, Math.max(0, slotsAvailable));
 
-    // v3: Get Kelly multiplier for position sizing
+    const toExecute = selectForEntry(
+      pipelineResult.signals,
+      Math.max(0, slotsAvailable),
+      state.consecutiveLosses ?? 0
+    );
+
+    // Get Kelly multiplier for position sizing
     let kellyMult = 1.0;
     try {
       kellyMult = await getKellyMultiplier(userId);
     } catch { /* use default */ }
 
-    for (const setup of toExecute) {
+    for (const signal of toExecute) {
       try {
-        const entryPrice = parseFloat(setup.pair.priceUsd);
+        const entryPrice = signal.priceUsd;
         if (entryPrice <= 0) continue;
 
-        // v4: Multi-source price validation
+        // Multi-source price validation
         try {
-          const priceCheck = await fullPriceValidation(setup.pair, 100); // Check with $100 baseline
+          const priceCheck = await fullPriceValidation(signal.rawPair || signal, 100);
           if (!priceCheck.valid) {
-            console.log(`[PriceValidator] Rejected ${setup.pair.baseToken.symbol}: ${priceCheck.reasons.join(", ")}`);
+            console.log(`[PriceValidator] Rejected ${signal.symbol}: ${priceCheck.reasons.join(", ")}`);
             continue;
           }
-        } catch { /* non-critical — proceed if validation fails */ }
+        } catch { /* proceed if validation fails */ }
 
-        // v4: MAE-optimized stop loss (uses historical data if available)
+        // Use pipeline's exit plan for stop loss and TP levels
+        const exitPlan = signal.exitPlan;
+        const stopLossPct = exitPlan?.stopLossPercent ?? dynamicParams.stopLossPercent;
+        const tp1Pct = exitPlan?.tp1Percent ?? dynamicParams.tp1Percent;
+        const tpEarlyPct = exitPlan?.tpEarlyPercent ?? dynamicParams.tpEarlyPercent;
+        const tp2Pct = exitPlan?.tp2Percent ?? dynamicParams.tp2Percent;
+
+        // MAE-optimized stop loss override (if we have enough data)
         let optimalSL: number | null = null;
         try {
-          optimalSL = await getOptimalStopLoss(userId, dynamicParams.stopLossPercent);
-        } catch { /* use default */ }
-        const stopLossPct = optimalSL ?? dynamicParams.stopLossPercent;
-        const stopLoss = entryPrice * (1 - stopLossPct / 100);
-        const tp1 = entryPrice * (1 + dynamicParams.tp1Percent / 100);
+          optimalSL = await getOptimalStopLoss(userId, stopLossPct);
+        } catch { /* use pipeline default */ }
+        const finalSLPct = optimalSL ?? stopLossPct;
 
-        let posSize = calculatePositionSize(balance, entryPrice, stopLoss, setup.score);
+        const stopLoss = entryPrice * (1 - finalSLPct / 100);
+        const tp1 = entryPrice * (1 + tp1Pct / 100);
 
-        // v3: Apply risk manager multiplier (drawdown + regime + consecutive losses)
+        // Position sizing: use pipeline's conviction-based size
+        let posSize = pipelineCalcSize(signal, balance, kellyMult);
+
+        // Apply risk manager multiplier
         if (riskAssessment) {
           posSize *= riskAssessment.positionSizeMultiplier;
         }
 
-        // v3: Apply Kelly criterion multiplier
-        posSize *= kellyMult;
-
-        // v4: Apply equity curve multiplier
+        // Apply equity curve multiplier
         posSize *= equityCurveMultiplier;
 
-        // v4: Apply time-of-day multiplier
+        // Apply time-of-day multiplier
         posSize *= timeMultiplier;
 
-        // v4: Apply volatility-adjusted sizing
+        // Apply volatility-adjusted sizing
         try {
-          const volMult = getVolatilityMultiplier(setup.pair);
+          const volMult = getVolatilityMultiplier(signal.rawPair || signal);
           posSize *= volMult;
         } catch { /* use default */ }
 
-        // v4: Slippage-aware sizing — reduce if slippage would be excessive
+        // Slippage-aware sizing
         try {
-          const { adjustedSize, wasReduced, slippage } = adjustPositionForSlippage(posSize, setup.pair);
+          const { adjustedSize, wasReduced, slippage } = adjustPositionForSlippage(posSize, signal.rawPair || signal);
           if (!slippage.executable) {
-            console.log(`[Slippage] Skipping ${setup.pair.baseToken.symbol}: ${slippage.tier} slippage (${slippage.slippagePercent.toFixed(1)}%)`);
+            console.log(`[Slippage] Skipping ${signal.symbol}: ${slippage.tier} slippage`);
             continue;
-          }
-          if (wasReduced) {
-            console.log(`[Slippage] Reduced ${setup.pair.baseToken.symbol} from $${posSize.toFixed(2)} to $${adjustedSize.toFixed(2)}`);
           }
           posSize = adjustedSize;
         } catch { /* use original size */ }
 
         if (posSize < 1) continue;
 
-        // v3: Check chain concentration limits
+        // Chain concentration limits
         const chainCheck = canEnterChain(
-          setup.pair.chainId,
+          signal.chain,
           posSize,
           openPositions,
           balance
         );
         if (!chainCheck.allowed) {
-          console.log(`[RiskManager] Skipping ${setup.pair.baseToken.symbol}: ${chainCheck.reason}`);
+          console.log(`[RiskManager] Skipping ${signal.symbol}: ${chainCheck.reason}`);
           continue;
         }
 
         const tokenAmount = posSize / entryPrice;
 
+        // Build comprehensive entry reason from pipeline
+        const entryReasons = [
+          `Tier:${signal.convictionTier}`,
+          `Conv:${signal.convictionScore}`,
+          `Trust:${signal.trustScore}`,
+          `Momentum:${signal.momentumQuality}`,
+          `Entry:${signal.entryGuidance}`,
+          `Persist:${signal.persistenceScanCount}scans`,
+          `Trade:${signal.tradeabilityGrade}`,
+          ...signal.topFactors.slice(0, 3),
+        ].join(" | ");
+
         await withDbRetry(
           () => queries.createPaperPosition({
             userId,
-            tokenAddress: setup.pair.baseToken.address,
-            tokenSymbol: setup.pair.baseToken.symbol.toUpperCase(),
-            chain: setup.pair.chainId,
-            pairAddress: setup.pair.pairAddress,
+            tokenAddress: signal.tokenAddress,
+            tokenSymbol: signal.symbol,
+            chain: signal.chain,
+            pairAddress: signal.pairAddress,
             entryPrice: entryPrice.toFixed(10),
             currentPrice: entryPrice.toFixed(10),
             positionSizeUsd: posSize.toFixed(2),
@@ -937,33 +602,33 @@ export async function runEngineCycle(userId: number = DEFAULT_USER_ID): Promise<
             tp2Hit: false,
             originalPositionSize: posSize.toFixed(2),
             sizeSoldPercent: "0",
-            convictionScore: setup.score,
-            entryReason: setup.reasons.join(" | "),
-            entryVolume: (setup.pair.volume?.h24 ?? 0).toFixed(2),
-            entryLiquidity: (setup.pair.liquidity?.usd ?? 0).toFixed(2),
-            entryFdv: (setup.pair.fdv ?? 0).toFixed(2),
+            convictionScore: signal.convictionScore,
+            entryReason: entryReasons,
+            entryVolume: signal.volumeH24.toFixed(2),
+            entryLiquidity: signal.liquidity.toFixed(2),
+            entryFdv: signal.fdv.toFixed(2),
           }),
           "createPosition"
         );
 
         executed++;
 
-        // v3: Include risk context in notification
+        // Notification with full pipeline context
         const riskInfo = riskAssessment
-          ? ` | Risk: ${riskAssessment.riskLevel} (${riskAssessment.positionSizeMultiplier.toFixed(2)}x) | Regime: ${riskAssessment.regime}`
+          ? ` | Risk: ${riskAssessment.riskLevel} (${riskAssessment.positionSizeMultiplier.toFixed(2)}x)`
           : "";
-        const kellyInfo = kellyMult !== 1.0 ? ` | Kelly: ${kellyMult.toFixed(2)}x` : "";
-        const v4Info = `EC:${equityCurveMode} T:${timeMultiplier.toFixed(1)}x SL:${stopLossPct.toFixed(0)}%`;
+        const pipelineInfo = `Tier:${signal.convictionTier} Conv:${signal.convictionScore} Trust:${signal.trustScore} Momentum:${signal.momentumQuality}`;
         await notifyOwner({
-          title: `📈 PAPER BUY — ${setup.pair.baseToken.symbol}`,
-          content: `Entry: $${entryPrice.toFixed(8)} | Size: $${posSize.toFixed(2)} | SL: $${stopLoss.toFixed(8)} | TP1: $${tp1.toFixed(8)} | Score: ${setup.score}/100 | Chain: ${setup.pair.chainId}${riskInfo}${kellyInfo} | ${v4Info}\nReasons: ${setup.reasons.join(", ")}`,
+          title: `📈 PAPER BUY — ${signal.symbol} [${signal.convictionTier}]`,
+          content: `Entry: $${entryPrice.toFixed(8)} | Size: $${posSize.toFixed(2)} | SL: ${finalSLPct.toFixed(0)}% | TP1: ${tp1Pct}% | Chain: ${signal.chain}${riskInfo}\n${pipelineInfo}\nTop: ${signal.topFactors.slice(0, 3).join(", ")}`,
         }).catch(() => {});
       } catch (err: any) {
-        errors.push(`Execute ${setup.pair.baseToken.symbol}: ${err.message}`);
+        errors.push(`Execute ${signal.symbol}: ${err.message}`);
       }
     }
 
     // Log scan
+    const topSignal = pipelineResult.signals[0];
     await withDbRetry(
       () => queries.createScanLog({
         userId,
@@ -971,9 +636,9 @@ export async function runEngineCycle(userId: number = DEFAULT_USER_ID): Promise<
         tokensQualified: qualified,
         tradesExecuted: executed,
         positionsUpdated,
-        topCandidate: qualifiedSetups[0]?.pair.baseToken.symbol,
-        topCandidateScore: qualifiedSetups[0]?.score,
-        topCandidateChain: qualifiedSetups[0]?.pair.chainId,
+        topCandidate: topSignal?.symbol,
+        topCandidateScore: topSignal?.convictionScore,
+        topCandidateChain: topSignal?.chain,
         scanDurationMs: Date.now() - cycleStartTime,
       }),
       "createScanLog"
@@ -987,8 +652,8 @@ export async function runEngineCycle(userId: number = DEFAULT_USER_ID): Promise<
         totalScans: (state!.totalScans ?? 0) + 1,
         lastScanTokensScanned: scanned,
         lastScanTokensQualified: qualified,
-        lastScanTopCandidate: qualifiedSetups[0]?.pair.baseToken.symbol,
-        lastScanTopScore: qualifiedSetups[0]?.score,
+        lastScanTopCandidate: topSignal?.symbol,
+        lastScanTopScore: topSignal?.convictionScore,
       } as any),
       "updateEngineState"
     );
@@ -996,7 +661,7 @@ export async function runEngineCycle(userId: number = DEFAULT_USER_ID): Promise<
     // Log rate limiter metrics
     const rlMetrics = getDexRateLimiterMetrics();
     if (rlMetrics.rateLimitHits > 0 || rlMetrics.failedRequests > 0) {
-      console.log(`[RateLimiter] Requests: ${rlMetrics.totalRequests} | Failed: ${rlMetrics.failedRequests} | 429s: ${rlMetrics.rateLimitHits} | Queue: ${rlMetrics.currentQueueSize}`);
+      console.log(`[RateLimiter] Requests: ${rlMetrics.totalRequests} | Failed: ${rlMetrics.failedRequests} | 429s: ${rlMetrics.rateLimitHits}`);
     }
 
   } catch (err: any) {
@@ -1055,7 +720,7 @@ async function monitorPosition(pos: any, userId: number): Promise<boolean> {
   const posSize = parseFloat(pos.positionSizeUsd);
   const highWater = parseFloat(pos.highestPrice ?? pos.entryPrice);
 
-  // v4: Track MAE (Maximum Adverse Excursion) for stop-loss optimization
+  // Track MAE (Maximum Adverse Excursion) for stop-loss optimization
   const drawdownFromEntry = ((entryPrice - currentPrice) / entryPrice) * 100;
   if (drawdownFromEntry > 0) {
     try {
@@ -1099,105 +764,89 @@ async function monitorPosition(pos: any, userId: number): Promise<boolean> {
       await withDbRetry(
         () => queries.upsertEngineState(userId, {
           equity: newEquity.toFixed(2),
+          peakEquity: Math.max(newEquity, parseFloat(state.peakEquity ?? "1000")).toFixed(2),
           dailyPnlUsd: newDailyPnl.toFixed(2),
+          totalPnlUsd: (parseFloat(state.totalPnlUsd ?? "0") + partialPnl).toFixed(2),
         } as any),
-        `updateEquity_${tierName}`
+        `updateState_${tierName}`
       );
     }
 
-    // Update position
-    Object.assign(updateData, {
+    Object.assign(updateData, tierUpdate, {
       positionSizeUsd: newPosSize.toFixed(2),
       sizeSoldPercent: newSizeSold.toFixed(2),
-      ...tierUpdate,
     });
 
     await notifyOwner({
       title: `🎯 ${tierName} — ${pos.tokenSymbol} +${pnlPercent.toFixed(1)}%`,
-      content: `Sold ${(sellRatio * 100).toFixed(0)}% ($${sellAmount.toFixed(2)}) at $${currentPrice.toFixed(8)}. P&L: $${partialPnl.toFixed(2)}. Remaining: $${newPosSize.toFixed(2)} (${(100 - newSizeSold).toFixed(0)}%)`,
+      content: `Sold ${(sellRatio * 100).toFixed(0)}% ($${sellAmount.toFixed(2)}) | P&L: $${partialPnl.toFixed(2)} | Remaining: ${(100 - newSizeSold).toFixed(0)}%`,
     }).catch(() => {});
   }
 
-  // Tier 1: Early Profit at +12% — sell 20%, lock SL at entry+2% (NEVER breakeven)
+  // TIER 0: Early profit lock
   if (!pos.tpEarlyHit && pnlPercent >= dynamicParams.tpEarlyPercent) {
-    const profitLockPrice = entryPrice * (1 + dynamicParams.earlyProfitLockPercent / 100);
-    const newSL = Math.max(stopLoss, profitLockPrice);
-    await handlePartialExit(dynamicParams.tpEarlySellRatio, "EARLY PROFIT", {
-      tpEarlyHit: true,
-      stopLossPrice: newSL.toFixed(10),
+    await handlePartialExit(dynamicParams.tpEarlySellRatio, "TP-EARLY", { tpEarlyHit: true });
+  }
+
+  // TIER 1: First take-profit
+  if (!pos.tp1Hit && currentPrice >= tp1) {
+    await handlePartialExit(dynamicParams.tp1SellRatio, "TP1", {
+      tp1Hit: true,
+      tp1Partial: true,
     });
-    updateData.stopLossPrice = newSL.toFixed(10);
+
+    // Move stop to breakeven + buffer
+    const breakEvenStop = entryPrice * (1 + dynamicParams.earlyProfitLockPercent / 100);
+    if (breakEvenStop > stopLoss) {
+      updateData.stopLossPrice = breakEvenStop.toFixed(10);
+    }
   }
 
-  // Tier 2: TP1 at +20% — sell 25%, tighten trailing
-  if (!pos.tp1Hit && pnlPercent >= dynamicParams.tp1Percent) {
-    await handlePartialExit(dynamicParams.tp1SellRatio, "TP1 HIT", { tp1Hit: true });
+  // TIER 2: Second take-profit
+  const tp2Price = entryPrice * (1 + dynamicParams.tp2Percent / 100);
+  if (pos.tp1Hit && !pos.tp2Hit && currentPrice >= tp2Price) {
+    await handlePartialExit(dynamicParams.tp2SellRatio, "TP2", { tp2Hit: true });
   }
 
-  // Tier 3: TP2 at +40% — sell 25%, very tight trailing
-  if (!pos.tp2Hit && pnlPercent >= dynamicParams.tp2Percent) {
-    await handlePartialExit(dynamicParams.tp2SellRatio, "TP2 HIT", { tp2Hit: true });
-  }
-
-  // Check if position is fully sold (100% exited via partial takes)
-  const totalSold = parseFloat(updateData.sizeSoldPercent ?? pos.sizeSoldPercent ?? "0");
-  if (totalSold >= 99.9) {
-    return await closePosition(pos, userId, currentPrice, "tp_hit", "Fully exited via tiered profit-taking");
-  }
-
-  // ── Rule 1: Stop loss hit ──
+  // ── STOP LOSS ──
   if (currentPrice <= stopLoss) {
-    return await closePosition(pos, userId, currentPrice, "stopped_out", `Stop loss hit`);
+    return await closePosition(pos, userId, currentPrice, "stopped_out",
+      `Stop loss hit at $${currentPrice.toFixed(8)} (SL: $${stopLoss.toFixed(8)})`);
   }
 
-  // ── Circuit breaker ──
-  if (pnlPercent < -dynamicParams.circuitBreakerPct) {
-    return await closePosition(pos, userId, currentPrice, "stopped_out", `CIRCUIT BREAKER: -${Math.abs(pnlPercent).toFixed(1)}% crash`);
+  // ── BREAKEVEN STOP RATCHET ──
+  if (pnlPercent >= dynamicParams.breakEvenThreshold && !pos.tp1Hit) {
+    const beStop = entryPrice * (1 + dynamicParams.earlyProfitLockPercent / 100);
+    if (beStop > stopLoss) {
+      updateData.stopLossPrice = beStop.toFixed(10);
+    }
   }
 
-  // ── ADAPTIVE TRAILING STOP (tightens with profit + tier + momentum fade) ──
-  if (newHighWater > entryPrice) {
+  // ── ADAPTIVE TRAILING STOP ──
+  if (pnlPercent > 0 && currentPrice < newHighWater) {
     const dropFromHigh = ((newHighWater - currentPrice) / newHighWater) * 100;
     const gainFromEntry = ((newHighWater - entryPrice) / entryPrice) * 100;
 
-    // Base trail: starts at trailInitial%, tightens by 1% per trailGainIncrement% gain
-    const gainTiers = Math.floor(gainFromEntry / dynamicParams.trailGainIncrement);
-    let trailPercent = dynamicParams.trailInitial - gainTiers;
-
-    // Additional tightening per profit-taking tier reached
-    const tp2Active = pos.tp2Hit || (updateData.tp2Hit === true);
-    const tp1Active = pos.tp1Hit || (updateData.tp1Hit === true);
-    const earlyActive = pos.tpEarlyHit || (updateData.tpEarlyHit === true);
-    if (tp2Active) {
-      trailPercent -= 3; // Very tight after TP2
-    } else if (tp1Active) {
-      trailPercent -= 2; // Tight after TP1
-    } else if (earlyActive) {
-      trailPercent -= 1; // Slightly tighter after early profit
+    // Trail tightens as profit grows
+    let trailPercent: number;
+    if (pos.tp2Hit) {
+      trailPercent = dynamicParams.trailBigWin;
+    } else if (pos.tp1Hit) {
+      trailPercent = dynamicParams.trailPostTp1;
+    } else {
+      trailPercent = dynamicParams.trailPreTp1;
     }
 
-    // Momentum fade: tighten if volume or buy pressure dropping
-    const currentVolH1 = pair.volume?.h1 ?? 0;
-    const entryVolume = parseFloat(pos.entryVolume ?? "0");
-    if (entryVolume > 0 && currentVolH1 < entryVolume * 0.3) {
-      trailPercent -= 2; // Volume fading
-    }
-    const m5Buys = pair.txns?.m5?.buys ?? 0;
-    const m5Sells = pair.txns?.m5?.sells ?? 0;
-    if ((m5Buys + m5Sells) > 0 && m5Buys / (m5Buys + m5Sells) < 0.4) {
-      trailPercent -= 1; // Sell pressure increasing
+    // Tighten trail based on gain magnitude
+    const gainTightening = Math.floor(gainFromEntry / 10) * (dynamicParams.trailGainIncrement / 2);
+    trailPercent = Math.max(dynamicParams.trailMinPercent, trailPercent - gainTightening);
+
+    // Momentum fade detection: if price dropped >50% from peak gain, tighten aggressively
+    if (gainFromEntry > 0 && pnlPercent < gainFromEntry * 0.5) {
+      trailPercent = Math.max(dynamicParams.trailMinPercent, trailPercent * 0.7);
     }
 
-    // Floor: never trail less than trailMinPercent (default 4%)
-    trailPercent = Math.max(trailPercent, dynamicParams.trailMinPercent);
-
-    // SL Ratchet: calculate new stop from high, only apply if higher than current
-    const trailStopPrice = newHighWater * (1 - trailPercent / 100);
-    if (trailStopPrice > stopLoss) {
-      updateData.stopLossPrice = trailStopPrice.toFixed(10);
-    }
-
-    if (dropFromHigh > trailPercent && pnlPercent > 0) {
+    if (dropFromHigh >= trailPercent) {
       return await closePosition(pos, userId, currentPrice, "closed",
         `Adaptive trail ${trailPercent.toFixed(1)}%: -${dropFromHigh.toFixed(1)}% from high ($${newHighWater.toFixed(8)})`);
     }
@@ -1218,7 +867,7 @@ async function monitorPosition(pos: any, userId: number): Promise<boolean> {
     if (holdDurationMs >= CONFIG.stalePositionTimeoutMs && absPnlPct < CONFIG.stalePositionMinMovePct) {
       const holdHours = (holdDurationMs / 3600000).toFixed(1);
       return await closePosition(pos, userId, currentPrice, "closed",
-        `Stale position: held ${holdHours}h with only ${pnlPercent >= 0 ? "+" : ""}${pnlPercent.toFixed(1)}% move (min ${CONFIG.stalePositionMinMovePct}% required)`);
+        `Stale position: held ${holdHours}h with only ${pnlPercent >= 0 ? "+" : ""}${pnlPercent.toFixed(1)}% move`);
     }
   }
 
@@ -1316,6 +965,15 @@ async function closePosition(
     );
   } catch { /* non-critical */ }
 
+  // v6: Record outcome in signal pipeline for cooldown learning
+  if (!isWin) {
+    recordEntryOutcome(pos.tokenSymbol, true);
+    // Set cooldown on losing tokens — prevent re-entry for 2 hours
+    setTokenCooldown(pos.tokenAddress, 2 * 60 * 60 * 1000, `Loss: ${pnlPercent.toFixed(1)}%`);
+  } else {
+    recordEntryOutcome(pos.tokenSymbol, false);
+  }
+
   // Learning system
   try {
     const holdTimeMin = pos.openedAt ? (Date.now() - new Date(pos.openedAt).getTime()) / 60000 : 0;
@@ -1371,8 +1029,10 @@ export function startEngine(userId: number = DEFAULT_USER_ID) {
   }
 
   running = true;
-  console.log(`[Engine] Starting for user ${userId}, interval: ${CONFIG.scanIntervalMs}ms`);
-  console.log(`[Engine] v4 Features: rate-limiter, 4-tier profit-taking, adaptive trailing, social+whale scoring, risk-manager, MAE analysis, volatility sizing, price validation, time optimization, slippage estimation, holder analysis, equity curve MA, system guards, execution layer`);
+  console.log(`[Engine v6] Starting for user ${userId}, interval: ${CONFIG.scanIntervalMs}ms`);
+  console.log(`[Engine v6] 14-Layer Signal Pipeline ACTIVE — conviction model, scam defense, persistence tracking, behavior protection, exit planning`);
+  console.log(`[Engine v6] Risk layers: Kelly criterion, BTC regime, equity curve MA, MAE stop-loss, volatility sizing, slippage estimation`);
+  console.log(`[Engine v6] Learning: auto-tuner, pattern tracking, token cooldowns, per-chain weight adjustment`);
 
   // Register self-heal
   setSelfHealCallback(async () => {
